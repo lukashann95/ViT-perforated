@@ -419,8 +419,14 @@ def main_worker(gpu, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     if args.wandb and is_primary(args):
+        from dotenv import load_dotenv
+
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+        wandb_token = os.environ.get('WANDB_API_TOKEN')
+        if wandb_token and os.environ.get('WANDB_MODE', 'online') not in ('offline', 'disabled'):
+            wandb.login(key=wandb_token)
         wandb.init(
-            project="mup-vit",
+            project=os.environ.get('WANDB_PROJECT'),
             name=args.name,
             id=args.name,
             notes=args.wandb_notes,
