@@ -358,11 +358,12 @@ def main_worker(gpu, args):
             value_range
         ])
 
-        train_dataset = datasets.ImageNet(args.data, split='train', transform=v2.Compose(transform))
+        train_dataset = datasets.ImageFolder(
+            os.path.join(args.data, 'train'),
+            transform=v2.Compose(transform))
 
-        val_dataset = datasets.ImageNet(
-            args.data,
-            split='val',
+        val_dataset = datasets.ImageFolder(
+            os.path.join(args.data, 'val'),
             transform=v2.Compose([
                 v2.ToImage(),
                 v2.Resize(256),
