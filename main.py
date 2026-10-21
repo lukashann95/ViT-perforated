@@ -131,6 +131,10 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 parser.add_argument('--fake-data', action='store_true', help="use fake data to benchmark")
+parser.add_argument('--amp', action='store_true',
+                    help='Use CUDA FP16 automatic mixed precision (default: FP32)')
+parser.add_argument('--max-steps', type=int, default=None,
+                    help='Limit training batches in this invocation without shortening the LR schedule')
 parser.add_argument("--logs", default="./logs/", type=str,
                     help="Where to store logs. Use None to avoid storing logs.")
 parser.add_argument('--name', default=None, type=str,
@@ -157,6 +161,10 @@ def chunk(n, device, *tensors):
 
 def main():
     args = parser.parse_args()
+    if args.max_steps is not None and args.max_steps <= 0:
+        parser.error('--max-steps must be positive')
+    if args.amp and not torch.cuda.is_available():
+        parser.error('--amp requires a CUDA GPU')
 
     if not args.mlp_head:
         args.representation_size = None
@@ -403,6 +411,8 @@ def main_worker(gpu, args):
         warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / args.warmup)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [args.warmup])
 
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -410,9 +420,11 @@ def main_worker(gpu, args):
             checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
             args.start_step = checkpoint['step']
             best_acc1 = checkpoint['best_acc1']
-            model.load_state_dict(checkpoint['state_dict'])
+            original_model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
+            if args.amp and checkpoint.get('scaler'):
+                scaler.load_state_dict(checkpoint['scaler'])
             print("=> loaded checkpoint '{}' (step {})"
                   .format(args.resume, checkpoint['step']))
         else:
@@ -446,7 +458,7 @@ def main_worker(gpu, args):
         # evaluate on validation set.
         validate(val_loader, model, args.start_step, device, args)
     else:
-        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, device, args)
+        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args)
 
     if args.distributed or args.ngpus_per_node > 1:
         dist.destroy_process_group()
@@ -461,7 +473,10 @@ def infinite_loader(loader, sampler):
         epoch += 1
 
 
-def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, device, args):
+def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args):
+    if args.max_steps is not None:
+        total_steps = min(total_steps, start_step + args.max_steps)
+        args.specified_steps.add(total_steps)
     batch_time = AverageMeter('Time', device, ':6.3f')
     data_time = AverageMeter('Data', device, ':6.3f')
     losses = AverageMeter('Loss', device, ':.4e')
@@ -488,20 +503,25 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         for img, trt1, trt2 in chunk(args.accum_freq, device, images, target1, target2):
             # compute output
-            _, loss = model(img, lam, trt1, trt2)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp):
+                _, loss = model(img, lam, trt1, trt2)
 
             # record loss
             step_loss += loss.item()
 
             # compute gradient
-            (loss / args.accum_freq).backward()
+            scaler.scale(loss / args.accum_freq).backward()
 
         step_loss /= args.accum_freq
         losses.update(step_loss, images.size(0))
 
-        # do SGD step
+        # Unscale only after all microbatches have accumulated, before clipping.
+        scaler.unscale_(optimizer)
         l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-        optimizer.step()
+        previous_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer_updated = scaler.get_scale() >= previous_scale
         optimizer.zero_grad()
 
         # measure elapsed time
@@ -529,6 +549,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 }
                 wandb.log(log_data, step=step)
 
+        # Overflow skips the optimizer update, so also skip the LR update.
+        # Advance before checkpointing so resume restores the next step's LR.
+        if optimizer_updated:
+            scheduler.step()
+
         if step % args.log_steps == 0 or step in args.specified_steps:
             acc1 = validate(val_loader, model, step, device, args)
 
@@ -543,10 +568,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     'best_acc1': best_acc1,
                     'optimizer' : optimizer.state_dict(),
                     'scheduler' : scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                 }
                 save_checkpoint(ckpt, is_best, args.checkpoint_path, step=step if step in args.specified_steps else None)
-
-        scheduler.step()
 
     del gen
 
@@ -563,7 +587,8 @@ def validate(val_loader, model, step, device, args):
                 i = base_progress + i
                 for img, trt in chunk(args.accum_freq, device, images, target):
                     # compute output
-                    output, loss = model(img, 1.0, trt, trt)
+                    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp):
+                        output, loss = model(img, 1.0, trt, trt)
 
                     # measure accuracy and record loss
                     acc1, acc5 = accuracy(output, trt, topk=(1, 5))
