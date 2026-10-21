@@ -1,0 +1,31 @@
+[project]
+name = "vit-perforated"
+version = "0.1.0"
+description = "PyTorch Vision Transformer training on ImageNet-1k"
+readme = "README.md"
+authors = [
+    { name = "Lukas Hann", email = "lukash@andrew.cmu.edu" }
+]
+requires-python = ">=3.10,<3.13"
+# Dependencies for main.py, simple_vit.py, and transforms.py.
+# Historical calibration notebooks may require separate analysis environments.
+dependencies = [
+    "pillow>=9.1.0",
+    "python-dotenv>=1.0.0",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "wandb==0.23.1",
+]
+
+# This repository runs scripts directly; it is not an installable Python package.
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
