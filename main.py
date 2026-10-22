@@ -480,6 +480,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     batch_time = AverageMeter('Time', device, ':6.3f')
     data_time = AverageMeter('Data', device, ':6.3f')
     losses = AverageMeter('Loss', device, ':.4e')
+    interval_loss_sum = 0.0
+    interval_samples = 0
     progress = ProgressMeter(
         total_steps,
         [batch_time, data_time, losses])
@@ -514,6 +516,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         step_loss /= args.accum_freq
         losses.update(step_loss, images.size(0))
+        interval_loss_sum += step_loss * images.size(0)
+        interval_samples += images.size(0)
 
         # Unscale only after all microbatches have accumulated, before clipping.
         scaler.unscale_(optimizer)
@@ -530,6 +534,16 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         if step % args.print_freq == 0:
             progress.display(step)
+            if args.wandb:
+                # Every rank must participate before rank 0 writes to W&B.
+                # Reduce sums and counts to obtain sample-weighted global means.
+                loss_stats = torch.tensor(
+                    [interval_loss_sum, interval_samples,
+                     step_loss * images.size(0), images.size(0)],
+                    dtype=torch.float64, device=device)
+                if args.distributed:
+                    dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+                interval_sum, interval_count, latest_sum, latest_count = loss_stats.tolist()
             if args.wandb and is_primary(args):
 
                 with torch.no_grad():
@@ -538,7 +552,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 samples_per_second_per_gpu = args.batch_size / batch_time.val
                 samples_per_second = samples_per_second_per_gpu * args.world_size
                 log_data = {
-                    "train/loss": step_loss,
+                    "train/loss": interval_sum / interval_count,
+                    "train/loss_step": latest_sum / latest_count,
                     "data_time": data_time.val,
                     "batch_time": batch_time.val,
                     "samples_per_second": samples_per_second,
@@ -548,6 +563,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "l2_params": math.sqrt(l2_params)
                 }
                 wandb.log(log_data, step=step)
+            interval_loss_sum = 0.0
+            interval_samples = 0
 
         # Overflow skips the optimizer update, so also skip the LR update.
         # Advance before checkpointing so resume restores the next step's LR.
@@ -556,6 +573,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         if step % args.log_steps == 0 or step in args.specified_steps:
             acc1 = validate(val_loader, model, step, device, args)
+            # Validation switches to eval mode; restore it for subsequent training.
+            model.train()
 
             # remember best acc@1 and save checkpoint
             is_best = acc1 > best_acc1
