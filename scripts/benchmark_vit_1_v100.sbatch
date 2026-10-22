@@ -11,12 +11,6 @@
 
 set -euo pipefail
 
-module load anaconda3
-conda deactivate
-conda activate /ocean/projects/cis250019p/mzhang23/TA/envs/IDLF26
-export PYTHONNOUSERSITE=1
-export OMP_NUM_THREADS=1
-
 REPO="${REPO:-$HOME/ViT-perforated}"
 OUTPUT="${OUTPUT:-$PROJECT/vit_perforated/benchmark-${SLURM_JOB_ID}}"
 # Override at submission, e.g. sbatch --export=ALL,STEPS=50,ACCUM_FREQ=32 ...
@@ -50,7 +44,7 @@ for model in small tiny; do
         echo "Starting $name: $STEPS steps, accumulation $ACCUM_FREQ"
         started=$SECONDS
         status=0
-        python -u main.py \
+        uv run python -u main.py \
             --fake-data \
             --hidden-dim "$hidden" \
             --num-layers 12 \
