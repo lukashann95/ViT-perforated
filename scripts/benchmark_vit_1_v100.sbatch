@@ -13,19 +13,19 @@ set -euo pipefail
 
 REPO="/ocean/projects/cis260364p/shared/ViT-perforated"
 OUTPUT="/ocean/projects/cis260364p/shared/ViT-perforated/benchmark-${SLURM_JOB_ID}"
-# Override at submission, e.g. sbatch --export=ALL,STEPS=50,ACCUM_FREQ=32 ...
+# Override duration at submission, e.g. sbatch --export=ALL,STEPS=50 ...
 STEPS="${STEPS:-100}"
-ACCUM_FREQ="${ACCUM_FREQ:-16}"
 mkdir -p "$OUTPUT"
 cd "$REPO"
 
 # No ImageNet path or copying: --fake-data generates samples on the CPU.
-# Same total batch and microbatch for all runs (1024 / 16 = 64 by default).
+# AMP only, with total batch 1024 and accumulation 16, 8, 4, 2
+# (microbatch sizes 64, 128, 256, 512 respectively).
 # Full synthetic validation and checkpoint saving occur at the final step.
 # W&B is omitted to make these smoke tests independent of authentication.
 # Total elapsed time includes compilation, validation, and checkpoint writes;
 # compare later training Time values (outside parentheses) for step throughput.
-printf 'model\tprecision\texit_code\telapsed_seconds\n' > "$OUTPUT/summary.tsv"
+printf 'model\tprecision\taccum_freq\tmicrobatch_size\texit_code\telapsed_seconds\n' > "$OUTPUT/summary.tsv"
 failed=0
 for model in small tiny; do
     if [[ "$model" == small ]]; then
@@ -35,12 +35,9 @@ for model in small tiny; do
         hidden=192
         heads=3
     fi
-    for precision in fp32 amp; do
-        amp_args=()
-        if [[ "$precision" == amp ]]; then
-            amp_args=(--amp)
-        fi
-        name="vit_${model}_${precision}"
+    for ACCUM_FREQ in 16 8 4 2; do
+        microbatch_size=$((1024 / ACCUM_FREQ))
+        name="vit_${model}_amp_accum${ACCUM_FREQ}"
         echo "Starting $name: $STEPS steps, accumulation $ACCUM_FREQ"
         started=$SECONDS
         status=0
@@ -61,9 +58,9 @@ for model in small tiny; do
             --workers 5 \
             --logs "$OUTPUT" \
             --name "$name" \
-            "${amp_args[@]}" > "$OUTPUT/$name.log" 2>&1 || status=$?
+            --amp > "$OUTPUT/$name.log" 2>&1 || status=$?
         elapsed=$((SECONDS - started))
-        printf '%s\t%s\t%s\t%s\n' "$model" "$precision" "$status" "$elapsed" >> "$OUTPUT/summary.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$model" amp "$ACCUM_FREQ" "$microbatch_size" "$status" "$elapsed" >> "$OUTPUT/summary.tsv"
         echo "Finished $name: exit=$status, elapsed=${elapsed}s; log: $OUTPUT/$name.log"
         if (( status != 0 )); then
             failed=1
