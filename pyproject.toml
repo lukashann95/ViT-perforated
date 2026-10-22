@@ -12,6 +12,8 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "pillow>=9.1.0",
     "python-dotenv>=1.0.0",
+    # Triton 3.2 imports setuptools at runtime during torch.compile.
+    "setuptools",
     "torch==2.6.0",
     "torchvision==0.21.0",
     "wandb==0.23.1",
