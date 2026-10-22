@@ -19,8 +19,7 @@ mkdir -p "$OUTPUT"
 cd "$REPO"
 
 # No ImageNet path or copying: --fake-data generates samples on the CPU.
-# AMP only, with total batch 1024 and accumulation 16, 8, 4, 2
-# (microbatch sizes 64, 128, 256, 512 respectively).
+# One AMP run per model, with accumulation 1 (full microbatch of 1024).
 # Full synthetic validation and checkpoint saving occur at the final step.
 # W&B is omitted to make these smoke tests independent of authentication.
 # Total elapsed time includes compilation, validation, and checkpoint writes;
@@ -35,7 +34,7 @@ for model in small tiny; do
         hidden=192
         heads=3
     fi
-    for ACCUM_FREQ in 16 8 4 2; do
+    for ACCUM_FREQ in 1; do
         microbatch_size=$((1024 / ACCUM_FREQ))
         name="vit_${model}_amp_accum${ACCUM_FREQ}"
         echo "Starting $name: $STEPS steps, accumulation $ACCUM_FREQ"
