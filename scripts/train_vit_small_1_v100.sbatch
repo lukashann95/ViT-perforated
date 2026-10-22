@@ -21,24 +21,33 @@ cp /jet/home/lhann/.env "$REPO/.env"
 
 # Fail before staging data if required paths or the environment are unavailable.
 : "${LOCAL:?PSC node-local storage path is not set}"
-test -d "$IMAGENET/train"
-test -d "$IMAGENET/val"
+test -r "$IMAGENET/train.tar"
+test -r "$IMAGENET/val.tar"
 command -v uv
 
-# Copy ImageNet into node-local storage
+# Stage archives, then extract locally to avoid shared-filesystem small-file reads.
+# Archives already contain train/<class>/ and val/<class>/ directories.
 mkdir -p "$LOCAL/imagenet"
 
 echo "Copying ImageNet..."
 copy_started=$SECONDS
 for split in train val; do
-    echo "Copying ImageNet $split..."
+    echo "Copying ImageNet $split.tar..."
     split_started=$SECONDS
     rsync -a --info=progress2 --stats --outbuf=L \
-        "$IMAGENET/$split" "$LOCAL/imagenet/"
-    echo "ImageNet $split copy complete in $((SECONDS - split_started)) seconds."
+        "$IMAGENET/$split.tar" "$LOCAL/imagenet/"
+    echo "ImageNet $split archive copy complete in $((SECONDS - split_started)) seconds."
+    echo "Extracting ImageNet $split (progress every approximately 1 GB)..."
+    extract_started=$SECONDS
+    tar --extract --file="$LOCAL/imagenet/$split.tar" \
+        --directory="$LOCAL/imagenet" --no-same-owner --no-same-permissions \
+        --checkpoint=100000 --checkpoint-action=echo
+    test -d "$LOCAL/imagenet/$split"
+    echo "ImageNet $split extraction complete in $((SECONDS - extract_started)) seconds."
+    rm -- "$LOCAL/imagenet/$split.tar"
 done
 
-echo "ImageNet copy complete in $((SECONDS - copy_started)) seconds total."
+echo "ImageNet staging complete in $((SECONDS - copy_started)) seconds total."
 
 # Configure W&B
 mkdir -p "$OUTPUT"
