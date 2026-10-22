@@ -58,7 +58,7 @@ for model in small tiny; do
             --max-steps "$STEPS" \
             --print-freq 10 \
             --log-steps "$STEPS" \
-            --workers 8 \
+            --workers 5 \
             --logs "$OUTPUT" \
             --name "$name" \
             "${amp_args[@]}" > "$OUTPUT/$name.log" 2>&1 || status=$?
