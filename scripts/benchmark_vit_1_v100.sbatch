@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=vit-benchmark
-#SBATCH --account=TODO
+#SBATCH --account=cis260364p
 #SBATCH --partition=GPU-shared
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-REPO="${REPO:-$HOME/ViT-perforated}"
-OUTPUT="${OUTPUT:-$PROJECT/vit_perforated/benchmark-${SLURM_JOB_ID}}"
+REPO="/ocean/projects/cis260364p/shared/ViT-perforated"
+OUTPUT="/ocean/projects/cis260364p/shared/ViT-perforated/benchmark-${SLURM_JOB_ID}"
 # Override at submission, e.g. sbatch --export=ALL,STEPS=50,ACCUM_FREQ=32 ...
 STEPS="${STEPS:-100}"
 ACCUM_FREQ="${ACCUM_FREQ:-16}"
