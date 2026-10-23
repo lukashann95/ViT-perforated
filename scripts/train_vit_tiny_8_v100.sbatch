@@ -1,51 +1,61 @@
 #!/bin/bash
 #SBATCH --job-name=vit-tiny-8v100
-#SBATCH --account=TODO
+#SBATCH --account=cis260364p
 #SBATCH --partition=GPU
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=v100-32:8
 #SBATCH --cpus-per-task=40
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=slurm-%j.out
 
 set -euo pipefail
 
-# Activate environment
-module load anaconda3
-conda deactivate
-conda activate /ocean/projects/cis250019p/mzhang23/TA/envs/IDLF26
-export PYTHONNOUSERSITE=1
+# Avoid CPU thread oversubscription across eight training processes.
 export OMP_NUM_THREADS=1
 
 # Paths
-REPO="$HOME/ViT-perforated"
+REPO="/ocean/projects/cis260364p/shared/ViT-perforated"
 IMAGENET=/ocean/datasets/community/imagenet
-OUTPUT="$PROJECT/vit_perforated"
+OUTPUT="/ocean/projects/cis260364p/shared/ViT-perforated/train-tiny-8v100-${SLURM_JOB_ID}"
+
+cd "$REPO"
+
+: "${LOCAL:?PSC node-local storage path is not set}"
+test -r "$IMAGENET/train.tar"
+test -r "$IMAGENET/val.tar"
+command -v uv
 
 # Copy ImageNet into node-local storage
 mkdir -p "$LOCAL/imagenet"
 
 echo "Copying ImageNet..."
-rsync -a "$IMAGENET/train" "$LOCAL/imagenet/"
-rsync -a "$IMAGENET/val" "$LOCAL/imagenet/"
+copy_started=$SECONDS
+for split in train val; do 
+    echo "Copying ImageNet $split.tar..."
+    split_started=$SECONDS
+    rsync -a --info=progress2 --stats --outbuf=L \
+        "$IMAGENET/$split.tar" "$LOCAL/imagenet/"
+    echo "ImageNet $split archive copy complete in $((SECONDS - split_started)) seconds."
+    echo "Extracting ImageNet $split (progress every approximately 1 GB)..."
+    extract_started=$SECONDS
+    tar --extract --file="$LOCAL/imagenet/$split.tar" \
+        --directory="$LOCAL/imagenet" --no-same-owner --no-same-permissions \
+        --checkpoint=100000 --checkpoint-action=echo
+    test -d "$LOCAL/imagenet/$split"
+    echo "ImageNet $split extraction complete in $((SECONDS - extract_started)) seconds."
+    rm -- "$LOCAL/imagenet/$split.tar"
+done
 
-echo "ImageNet extraction complete."
+echo "ImageNet staging complete in $((SECONDS - copy_started)) seconds total."
 
-# Configure W&B
+# Config W&B
 mkdir -p "$OUTPUT"
 export WANDB_DIR="$OUTPUT"
+export WANDB_ENTITY="IdlF26Group40"
 export WANDB_PROJECT="ViT-perforated"
 
-# One Python parent spawns eight GPU workers via main.py.
-# Do not launch eight parent processes with srun/torchrun.
-# Batch 1024 / 8 GPUs = 128 images per GPU with accum-freq 1.
-# If memory is insufficient, use accum-freq 2 (64 images per microbatch).
-# Workers 32 is divided across GPUs: four data-loader workers per GPU.
-# Train
-cd "$REPO"
-
-python -u main.py "$LOCAL/imagenet" \
+uv run python -u main.py "$LOCAL/imagenet" \
     --multiprocessing-distributed \
     --world-size 1 \
     --rank 0 \
@@ -56,10 +66,11 @@ python -u main.py "$LOCAL/imagenet" \
     --patch-size 16 \
     --batch-size 1024 \
     --accum-freq 1 \
+    --amp \
     --mlp-head \
     --torchvision-inception-crop \
     --epochs 90 \
-    --workers 32 \
+    --workers 40 \
     --logs "$OUTPUT" \
-    --name vit_tiny_baseline_8v100 \
+    --name "vit_tiny_amp_8v100_${SLURM_JOB_ID}" \
     --report-to wandb

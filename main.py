@@ -1,6 +1,7 @@
 # Modified from https://github.com/pytorch/examples/blob/main/imagenet/main.py
 
 import argparse
+import builtins
 import functools
 import math
 import os
@@ -246,6 +247,10 @@ def main_worker(gpu, args):
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
             args.rank = args.rank * args.ngpus_per_node + gpu
+    if not is_primary(args):
+        # Only the primary process prints, so logs aren't repeated once per GPU.
+        # Warnings and tracebacks go to stderr and are unaffected.
+        builtins.print = lambda *a, **k: None
     if args.distributed or args.ngpus_per_node > 1:
         torch.cuda.set_device(args.rank)
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
