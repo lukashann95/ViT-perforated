@@ -485,11 +485,13 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     batch_time = AverageMeter('Time', device, ':6.3f')
     data_time = AverageMeter('Data', device, ':6.3f')
     losses = AverageMeter('Loss', device, ':.4e')
+    acc = AverageMeter('Acc@1', device, ':6.4f')
     interval_loss_sum = 0.0
+    interval_correct = 0.0
     interval_samples = 0
     progress = ProgressMeter(
         total_steps,
-        [batch_time, data_time, losses])
+        [batch_time, data_time, losses, acc])
 
     # switch to train mode
     model.train()
@@ -507,20 +509,27 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         # measure data loading time
         data_time.update(time.time() - end)
         step_loss = 0.0
+        step_correct = 0.0
 
         for img, trt1, trt2 in chunk(args.accum_freq, device, images, target1, target2):
             # compute output
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp):
-                _, loss = model(img, lam, trt1, trt2)
+                logits, loss = model(img, lam, trt1, trt2)
 
             # record loss
             step_loss += loss.item()
+            with torch.no_grad():
+                pred = logits.argmax(dim=1)
+                batch_correct = (lam * (pred == trt1).sum() + (1 - lam) * (pred == trt2).sum()).item()
+                step_correct += batch_correct
+                interval_correct += batch_correct
 
             # compute gradient
             scaler.scale(loss / args.accum_freq).backward()
 
         step_loss /= args.accum_freq
         losses.update(step_loss, images.size(0))
+        acc.update(step_correct / images.size(0), images.size(0))
         interval_loss_sum += step_loss * images.size(0)
         interval_samples += images.size(0)
 
@@ -544,11 +553,12 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 # Reduce sums and counts to obtain sample-weighted global means.
                 loss_stats = torch.tensor(
                     [interval_loss_sum, interval_samples,
-                     step_loss * images.size(0), images.size(0)],
+                     step_loss * images.size(0), images.size(0),
+                     interval_correct],
                     dtype=torch.float64, device=device)
                 if args.distributed:
                     dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
-                interval_sum, interval_count, latest_sum, latest_count = loss_stats.tolist()
+                interval_sum, interval_count, latest_sum, latest_count, correct_sum = loss_stats.tolist()
             if args.wandb and is_primary(args):
 
                 with torch.no_grad():
@@ -557,6 +567,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 samples_per_second_per_gpu = args.batch_size / batch_time.val
                 samples_per_second = samples_per_second_per_gpu * args.world_size
                 log_data = {
+                    "train/acc@1": correct_sum / interval_count,
                     "train/loss": interval_sum / interval_count,
                     "train/loss_step": latest_sum / latest_count,
                     "data_time": data_time.val,
@@ -568,6 +579,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "l2_params": math.sqrt(l2_params)
                 }
                 wandb.log(log_data, step=step)
+            interval_correct = 0.0
             interval_loss_sum = 0.0
             interval_samples = 0
 
