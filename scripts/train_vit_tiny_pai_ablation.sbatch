@@ -17,6 +17,8 @@
 #   task 2: dendrites on the MLP of encoder layer 7  (8th block)
 #   task 3: dendrites on the MLP of encoder layer 11 (12th block)
 # Override at submission, e.g. sbatch --export=ALL,EPOCHS=20,MAX_DENDRITES=1 ...
+# PAI_TARGET=ln_mlp also wraps each block's pre-norm ln_2 with its MLP. The control adds no
+# dendrites, so its result does not depend on PAI_TARGET; skip it with --array=1-3.
 
 set -euo pipefail
 
@@ -42,13 +44,17 @@ fi
 
 EPOCHS=${EPOCHS:-40}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
+PAI_TARGET=${PAI_TARGET:-mlp}
+# Default run names stay unchanged; other targets get a suffix.
+TARGET_TAG=""
+if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
 
 # Paths
 REPO="/ocean/projects/cis260364p/${USER}/ViT-perforated"
 IMAGENET=/ocean/datasets/community/imagenet
 SHARED=/ocean/projects/cis260364p/shared
 BASELINE="$SHARED/checkpoints/vit_tiny_amp_8v100_49682577/model_best.pth.tar"
-RUN_NAME="vit_tiny_pai_${ARM}_20pct_${SLURM_ARRAY_JOB_ID}"
+RUN_NAME="vit_tiny_pai_${ARM}${TARGET_TAG}_20pct_${SLURM_ARRAY_JOB_ID}"
 LOG_ROOT="$SHARED/logs"
 OUTPUT="$LOG_ROOT/$RUN_NAME"
 CHECKPOINTS="$SHARED/checkpoints/$RUN_NAME"
@@ -116,6 +122,7 @@ uv run python -u main.py "$LOCAL/imagenet" \
     --workers 5 \
     --pai-init "$BASELINE" \
     "${PAI_ARGS[@]}" \
+    --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \

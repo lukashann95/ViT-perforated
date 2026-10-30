@@ -30,7 +30,8 @@ def _import_pai():
     GPA, UPA = globals_perforatedai, utils_perforatedai
 
 # Submodule of torchvision's MLPBlock to perforate: Linear(D, 4D), GELU, Dropout, Linear(4D, D), Dropout.
-TARGETS = {'mlp': None, 'fc1': 0, 'fc2': 3}
+# 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP.
+TARGETS = {'mlp': None, 'ln_mlp': None, 'fc1': 0, 'fc2': 3}
 
 
 def add_arguments(parser):
@@ -39,7 +40,8 @@ def add_arguments(parser):
                        help='0-indexed encoder layers whose MLP gets dendrites, e.g. 3 7 11. '
                             'Enables PAI fine-tuning; requires --pai-init.')
     group.add_argument('--pai-target', default='mlp', choices=sorted(TARGETS),
-                       help='perforate the whole MLP block or only its first/second Linear')
+                       help='perforate the whole MLP block, the MLP with its pre-norm ln_2, '
+                            'or only its first/second Linear')
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
@@ -85,10 +87,15 @@ def load_init(model, path):
 def perforate(model, args):
     _import_pai()
     for i in args.pai_layers:
-        mlp = model.encoder.layers[i].mlp
+        block = model.encoder.layers[i]
+        mlp = block.mlp
         index = TARGETS[args.pai_target]
-        if index is None:
-            model.encoder.layers[i].mlp = GPA.PAISequential([mlp])
+        if args.pai_target == 'ln_mlp':
+            # forward() computes mlp(ln_2(x)), so moving ln_2 inside the wrapper keeps the math.
+            block.mlp = GPA.PAISequential([block.ln_2, mlp])
+            block.ln_2 = nn.Identity()
+        elif index is None:
+            block.mlp = GPA.PAISequential([mlp])
         else:
             mlp[index] = GPA.PAISequential([mlp[index]])
 
