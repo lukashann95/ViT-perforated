@@ -29,6 +29,7 @@ from torch.utils.data import Subset
 
 import wandb
 
+import pai_setup
 from simple_vit import SimpleVisionTransformer
 from transforms import TwoHotMixUp, TFInceptionCrop, RandAugment17
 
@@ -150,6 +151,7 @@ parser.add_argument("--report-to", default='', type=str,
                     help="Options are ['wandb']")
 parser.add_argument("--wandb-notes", default='', type=str,
                     help="Notes if logging with wandb")
+pai_setup.add_arguments(parser)
 best_acc1 = 0
 
 
@@ -205,6 +207,13 @@ def main():
             warnings.warn("nccl backend >=2.5 requires GPU count>1, see https://github.com/NVIDIA/nccl/issues/103 perhaps use 'gloo'")
     else:
         args.ngpus_per_node = 1
+    pai_setup.check_args(parser, args)
+    args.repo_dir = os.path.dirname(os.path.abspath(__file__))
+    if args.pai:
+        # PAI runs change into the log directory, so later paths must not depend on the cwd.
+        args.data = os.path.abspath(args.data)
+        args.logs = os.path.abspath(args.logs)
+        args.pai_init = os.path.abspath(args.pai_init)
 
     # get the name of the experiments
     if args.name is None:
@@ -215,7 +224,7 @@ def main():
             f"b_{args.batch_size}",
         ])
 
-    log_base_path = os.path.join(args.logs, args.name)
+    log_base_path = args.log_dir = os.path.join(args.logs, args.name)
     args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
     os.makedirs(args.checkpoint_path, exist_ok=True)
     args.wandb = 'wandb' in args.report_to
@@ -279,6 +288,11 @@ def main_worker(gpu, args):
         pool_type=args.pool_type,
         register=args.register,
     )
+    if args.pai:
+        pai_setup.load_init(model, args.pai_init)
+        # PAI writes its graphs, CSVs and saves to ./pai.
+        os.chdir(args.log_dir)
+        original_model = model = pai_setup.perforate(model, args)
 
     wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
     non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -313,11 +327,14 @@ def main_worker(gpu, args):
         {"params": non_wd_params, "weight_decay": 0.},
     ]
 
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=args.lr,
-        betas=(args.beta1, args.beta2)
-    )
+    if args.pai:
+        optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+    else:
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2)
+        )
 
     # Data loading code
     if args.fake_data:
@@ -448,10 +465,11 @@ def main_worker(gpu, args):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler,
         multiprocessing_context='spawn', prefetch_factor=1)
 
-    scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
-    if args.warmup:
-        warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / args.warmup)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [args.warmup])
+    if not args.pai:
+        scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
+        if args.warmup:
+            warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / args.warmup)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [args.warmup])
 
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
@@ -475,7 +493,7 @@ def main_worker(gpu, args):
     if args.wandb and is_primary(args):
         from dotenv import load_dotenv
 
-        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+        load_dotenv(os.path.join(args.repo_dir, '.env'))
         wandb_token = os.environ.get('WANDB_API_TOKEN')
         if wandb_token and os.environ.get('WANDB_MODE', 'online') not in ('offline', 'disabled'):
             wandb.login(key=wandb_token)
@@ -491,10 +509,12 @@ def main_worker(gpu, args):
         params_file = os.path.join(args.logs, args.name, "params.txt")
         wandb.save(params_file)
 
-    print('Compiling model...')
+    # PAI replaces modules when it adds dendrites, so PAI runs stay uncompiled.
+    if not args.pai:
+        print('Compiling model...')
 
-    # Inductor doesn't support MPS yet (https://github.com/pytorch/pytorch/issues/125254)
-    model = torch.compile(model, backend="aot_eager" if device.type == 'mps' else "inductor")
+        # Inductor doesn't support MPS yet (https://github.com/pytorch/pytorch/issues/125254)
+        model = torch.compile(model, backend="aot_eager" if device.type == 'mps' else "inductor")
 
     if args.evaluate:
         # evaluate on validation set.
@@ -542,6 +562,27 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             trt2.to(device, non_blocking=True))
     )
 
+    if args.pai:
+        if not args.pai_control:
+            # PAI records tensor shapes on the first training backward pass and cannot switch
+            # without one. Run one microbatch with no optimizer step.
+            images, lam, target1, target2 = next(gen)
+            img, trt1, trt2 = next(chunk(args.accum_freq, device, images, target1, target2))
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp):
+                _, loss = model(img, lam, trt1, trt2)
+            loss.backward()
+            optimizer.zero_grad()
+        # Score the loaded model so both arms log their starting point. The loaded model has
+        # already converged, so the perforated arm starts directly in a dendrite phase.
+        acc1 = validate(val_loader, model, start_step, device, args)
+        model, restructured, _ = pai_setup.add_score(model, acc1, args, device, force_switch=not args.pai_control)
+        original_model = model
+        model.train()
+        if restructured:
+            optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+        if args.wandb and is_primary(args):
+            wandb.log(pai_setup.stats(), step=start_step)
+
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -572,7 +613,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         # Unscale only after all microbatches have accumulated, before clipping.
         scaler.unscale_(optimizer)
-        l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+        # Clip only what the optimizer updates; PAI's dendrite phases update only dendrites.
+        l2_grads = torch.nn.utils.clip_grad_norm_(
+            [p for group in optimizer.param_groups for p in group['params']], args.grad_clip_norm)
         previous_scale = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
@@ -611,7 +654,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "batch_time": batch_time.val,
                     "samples_per_second": samples_per_second,
                     "samples_per_second_per_gpu": samples_per_second_per_gpu,
-                    "lr": scheduler.get_last_lr()[0],
+                    "lr": optimizer.param_groups[0]['lr'],
                     "l2_grads": l2_grads.item(),
                     "l2_params": math.sqrt(l2_params)
                 }
@@ -622,7 +665,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         # Overflow skips the optimizer update, so also skip the LR update.
         # Advance before checkpointing so resume restores the next step's LR.
-        if optimizer_updated:
+        # PAI steps its plateau scheduler from validation scores instead.
+        if optimizer_updated and not args.pai:
             scheduler.step()
 
         if step % args.log_steps == 0 or step in args.specified_steps:
@@ -634,6 +678,17 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
 
+            training_complete = False
+            if args.pai:
+                model, restructured, training_complete = pai_setup.add_score(model, acc1, args, device)
+                original_model = model
+                model.train()
+                if restructured:
+                    print(f"=> PAI restructured the model at step {step}")
+                    optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+                if args.wandb and is_primary(args):
+                    wandb.log(pai_setup.stats(), step=step)
+
             if is_primary(args):
                 ckpt = {
                     'step': step,
@@ -644,6 +699,10 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     'scaler': scaler.state_dict(),
                 }
                 save_checkpoint(ckpt, is_best, args.checkpoint_path, step=step if step in args.specified_steps else None)
+
+            if training_complete:
+                print(f"=> PAI reports training complete at step {step}")
+                break
 
     del gen
 
