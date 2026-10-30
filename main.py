@@ -39,6 +39,10 @@ torch.set_float32_matmul_precision('high')
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
+parser.add_argument('--train-fraction', default=1.0, type=float,
+                    help='fraction of training data to use, in (0, 1] (default: 1.0)')
+parser.add_argument('--subset-seed', default=42, type=int,
+                    help='seed for selecting the training subset, independent of --seed (default: 42)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--prefetch-factor', default=1, type=int, metavar='N',
@@ -162,6 +166,8 @@ def chunk(n, device, *tensors):
 
 def main():
     args = parser.parse_args()
+    if not 0 < args.train_fraction <= 1:
+        parser.error('--train-fraction must be in (0, 1]')
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error('--max-steps must be positive')
     if args.amp and not torch.cuda.is_available():
@@ -384,6 +390,19 @@ def main_worker(gpu, args):
                 v2.ToDtype(torch.float32, scale=True),
                 value_range,
             ]))
+
+    if args.train_fraction < 1:
+        full_size = len(train_dataset)
+        subset_size = int(full_size * args.train_fraction)
+        if subset_size == 0:
+            raise ValueError('--train-fraction selects no training examples')
+        # A dedicated generator keeps membership independent of model initialization
+        # and training randomness, and identical across distributed workers.
+        generator = torch.Generator().manual_seed(args.subset_seed)
+        indices = torch.randperm(full_size, generator=generator)[:subset_size].tolist()
+        train_dataset = Subset(train_dataset, indices)
+        print(f'Using {subset_size}/{full_size} training examples '
+              f'(subset seed: {args.subset_seed})')
 
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.total_batch_size)
