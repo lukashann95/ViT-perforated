@@ -50,6 +50,9 @@ def add_arguments(parser):
                        help='minimum validations in a neuron phase before PAI may switch')
     group.add_argument('--pai-p-epochs-to-switch', default=2, type=int,
                        help='minimum validations in a dendrite phase before PAI may switch')
+    group.add_argument('--pai-initial-correlation-batches', default=None, type=int,
+                       help="training batches before PAI scores dendrites (PAI default 100); "
+                            "must be below --log-steps")
     group.add_argument('--pai-patience', default=2, type=int,
                        help='ReduceLROnPlateau patience, in validations')
 
@@ -94,6 +97,8 @@ def perforate(model, args):
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
     pc.set_p_epochs_to_switch(args.pai_p_epochs_to_switch)
+    if args.pai_initial_correlation_batches is not None:
+        pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
     # Dendrites only on the wrapped targets. Everything else is tracked as a whole module, so
     # PAI never wraps the Linear that nn.MultiheadAttention uses internally.
     pc.set_modules_to_perforate([GPA.PAISequential])

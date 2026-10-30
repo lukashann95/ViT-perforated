@@ -66,5 +66,6 @@ uv run python -u main.py \
     --max-dendrites 1 \
     --pai-n-epochs-to-switch 1 \
     --pai-p-epochs-to-switch 1 \
+    --pai-initial-correlation-batches 2 \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME"
