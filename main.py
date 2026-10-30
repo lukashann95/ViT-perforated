@@ -40,7 +40,8 @@ parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('--train-fraction', default=1.0, type=float,
-                    help='fraction of training data to use, in (0, 1] (default: 1.0)')
+                    help='fraction of each training class to use, rounded down, in (0, 1] '
+                         '(default: 1.0; fake data uses a global random subset)')
 parser.add_argument('--subset-seed', default=42, type=int,
                     help='seed for selecting the training subset, independent of --seed (default: 42)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -393,16 +394,33 @@ def main_worker(gpu, args):
 
     if args.train_fraction < 1:
         full_size = len(train_dataset)
-        subset_size = int(full_size * args.train_fraction)
-        if subset_size == 0:
-            raise ValueError('--train-fraction selects no training examples')
         # A dedicated generator keeps membership independent of model initialization
         # and training randomness, and identical across distributed workers.
         generator = torch.Generator().manual_seed(args.subset_seed)
-        indices = torch.randperm(full_size, generator=generator)[:subset_size].tolist()
+        if args.fake_data:
+            subset_size = int(full_size * args.train_fraction)
+            indices = torch.randperm(full_size, generator=generator)[:subset_size].tolist()
+        else:
+            class_indices = {}
+            for index, target in enumerate(train_dataset.targets):
+                class_indices.setdefault(target, []).append(index)
+            indices = []
+            for target in sorted(class_indices):
+                members = class_indices[target]
+                # Round down per class; very small fractions may omit small classes.
+                count = int(len(members) * args.train_fraction)
+                order = torch.randperm(len(members), generator=generator)[:count].tolist()
+                indices.extend(members[i] for i in order)
+            # Avoid class-grouped ordering before the loader/sampler shuffles.
+            order = torch.randperm(len(indices), generator=generator).tolist()
+            indices = [indices[i] for i in order]
+        subset_size = len(indices)
+        if subset_size == 0:
+            raise ValueError('--train-fraction selects no training examples')
         train_dataset = Subset(train_dataset, indices)
         print(f'Using {subset_size}/{full_size} training examples '
-              f'(subset seed: {args.subset_seed})')
+              f'({"random" if args.fake_data else "stratified"} subset, '
+              f'subset seed: {args.subset_seed})')
 
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.total_batch_size)

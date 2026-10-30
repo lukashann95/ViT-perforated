@@ -66,7 +66,8 @@ export WANDB_DIR="$OUTPUT"
 export WANDB_ENTITY="IdlF26Group40"
 export WANDB_PROJECT="ViT-perforated"
 
-# ViT-Tiny/16: effective batch 1024, split into eight microbatches of 128.
+# ViT-Tiny/16: effective batch 1024, split into two microbatches of 512.
+# Complete a 30-epoch LR schedule with warmup scaled to the 20% subset.
 uv run python -u main.py "$LOCAL/imagenet" \
     --gpu 0 \
     --train-fraction 0.2 \
@@ -80,7 +81,8 @@ uv run python -u main.py "$LOCAL/imagenet" \
     --amp \
     --mlp-head \
     --torchvision-inception-crop \
-    --epochs 90 \
+    --epochs 30 \
+    --warmup 2000 \
     --workers 5 \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
