@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# PerforatedAI credentials (PAIEMAIL/PAITOKEN), if this user has them.
+if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
+
 # Paths
 REPO="/ocean/projects/cis260364p/shared/ViT-perforated"
 IMAGENET=/ocean/datasets/community/imagenet

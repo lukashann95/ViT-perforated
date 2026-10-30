@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# PerforatedAI credentials (PAIEMAIL/PAITOKEN), if this user has them.
+if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
+
 # Avoid CPU thread oversubscription across eight training processes.
 export OMP_NUM_THREADS=1
 

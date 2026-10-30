@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# PerforatedAI credentials (PAIEMAIL/PAITOKEN), if this user has them.
+if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
+
 # Allow project group members to read and write newly created outputs.
 umask 0002
 

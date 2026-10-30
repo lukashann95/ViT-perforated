@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# PerforatedAI credentials (PAIEMAIL/PAITOKEN), if this user has them.
+if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
+
 REPO="/ocean/projects/cis260364p/shared/ViT-perforated"
 OUTPUT="/ocean/projects/cis260364p/shared/ViT-perforated/benchmark-${SLURM_JOB_ID}"
 # Override duration at submission, e.g. sbatch --export=ALL,STEPS=50 ...
