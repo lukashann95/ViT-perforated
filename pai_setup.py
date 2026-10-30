@@ -128,10 +128,14 @@ def add_score(model, acc1, args, device, force_switch=False):
     return model.to(device), bool(restructured), training_complete
 
 
+def in_dendrite_phase():
+    return GPA.pai_tracker.member_vars.get('mode') == 'p'
+
+
 def stats():
     member_vars = GPA.pai_tracker.member_vars
     return {
-        'pai/mode': 1 if member_vars.get('mode') == 'p' else 0,
+        'pai/mode': 1 if in_dendrite_phase() else 0,
         'pai/dendrites_added': member_vars.get('num_dendrites_added', 0),
         # PAI's count excludes candidate-dendrite scaffolding, so it is the real model size.
         'pai/params': (member_vars.get('param_counts') or [0])[-1],

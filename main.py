@@ -611,15 +611,21 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         interval_loss_sum += step_loss * images.size(0)
         interval_samples += images.size(0)
 
-        # Unscale only after all microbatches have accumulated, before clipping.
-        scaler.unscale_(optimizer)
-        # Clip only what the optimizer updates; PAI's dendrite phases update only dendrites.
-        l2_grads = torch.nn.utils.clip_grad_norm_(
-            [p for group in optimizer.param_groups for p in group['params']], args.grad_clip_norm)
-        previous_scale = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer_updated = scaler.get_scale() >= previous_scale
+        if args.pai and pai_setup.in_dendrite_phase():
+            # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
+            # during backward, so GradScaler has nothing to unscale, clip or inf-check. The
+            # gradients carry the constant loss scale, which AdamW's update is invariant to.
+            l2_grads = torch.zeros((), device=device)
+            optimizer.step()
+            optimizer_updated = True
+        else:
+            # Unscale only after all microbatches have accumulated, before clipping.
+            scaler.unscale_(optimizer)
+            l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer_updated = scaler.get_scale() >= previous_scale
         optimizer.zero_grad()
 
         # measure elapsed time
