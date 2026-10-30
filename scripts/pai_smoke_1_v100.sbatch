@@ -53,7 +53,7 @@ uv run python -u main.py \
     --num-heads 3 \
     --patch-size 16 \
     --batch-size 1024 \
-    --accum-freq 2 \
+    --accum-freq 1 \
     --amp \
     --mlp-head \
     --lr 1e-4 \

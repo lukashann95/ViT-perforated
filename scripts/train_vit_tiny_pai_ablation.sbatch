@@ -94,7 +94,7 @@ export WANDB_DIR="$OUTPUT"
 export WANDB_ENTITY="IdlF26Group40"
 export WANDB_PROJECT="ViT-perforated"
 
-# ViT-Tiny/16 fine-tune: effective batch 1024 in two microbatches of 512.
+# ViT-Tiny/16 fine-tune: batch 1024 in one microbatch (PAI does not support gradient accumulation).
 # The 20% subset is about 250 steps per epoch; validate (and score for PAI) once per epoch.
 # PAI owns the LR schedule (ReduceLROnPlateau), so --warmup is unused.
 uv run python -u main.py "$LOCAL/imagenet" \
@@ -106,7 +106,7 @@ uv run python -u main.py "$LOCAL/imagenet" \
     --num-heads 3 \
     --patch-size 16 \
     --batch-size 1024 \
-    --accum-freq 2 \
+    --accum-freq 1 \
     --amp \
     --mlp-head \
     --torchvision-inception-crop \

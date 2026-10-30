@@ -68,6 +68,9 @@ def check_args(parser, args):
         parser.error('PAI runs support a single GPU only; pass --gpu 0')
     if args.resume:
         parser.error('--resume is not supported with PAI runs')
+    if args.accum_freq != 1:
+        # PAI stores one set of dendrite outputs and neuron errors per optimizer step.
+        parser.error('PAI runs need --accum-freq 1')
 
 
 def load_init(model, path):
