@@ -10,6 +10,9 @@ requires-python = ">=3.10,<3.13"
 # Dependencies for main.py, simple_vit.py, and transforms.py.
 # Historical calibration notebooks may require separate analysis environments.
 dependencies = [
+    # PerforatedAI dendrites; perforatedbp needs PAIEMAIL/PAITOKEN set at runtime.
+    "perforatedai==3.2.9",
+    "perforatedbp==3.2.9",
     "pillow>=9.1.0",
     "python-dotenv>=1.0.0",
     # Triton 3.2 imports setuptools at runtime during torch.compile.
