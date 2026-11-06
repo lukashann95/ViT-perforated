@@ -1,6 +1,7 @@
 """PerforatedAI (Perforated Backpropagation) support for main.py.
 
-Fine-tunes a trained SimpleVisionTransformer with dendrites on selected encoder MLPs.
+Fine-tunes a trained SimpleVisionTransformer with dendrites on selected encoder MLPs or
+attention q/k/v projections.
 PAI is imported only when --pai-layers is set, so baseline runs need neither the package
 nor PAI credentials. PAI reads PAIEMAIL and PAITOKEN from the environment.
 
@@ -11,6 +12,7 @@ import pdb
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 GPA = UPA = None
@@ -31,17 +33,61 @@ def _import_pai():
 
 # Submodule of torchvision's MLPBlock to perforate: Linear(D, 4D), GELU, Dropout, Linear(4D, D), Dropout.
 # 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP.
-TARGETS = {'mlp': None, 'ln_mlp': None, 'fc1': 0, 'fc2': 3}
+# 'qkv' replaces the block's attention and gives each of its q, k and v projections dendrites.
+TARGETS = {'mlp': None, 'ln_mlp': None, 'fc1': 0, 'fc2': 3, 'qkv': None}
+
+
+class QKVAttention(nn.Module):
+    """Drop-in for a batch_first nn.MultiheadAttention with separate q/k/v Linear modules.
+
+    nn.MultiheadAttention keeps q, k and v in one fused in_proj_weight, so PAI cannot wrap them
+    individually. This copies the trained weights into three Linears that wrap() can perforate,
+    and computes the same self-attention with scaled_dot_product_attention.
+    """
+
+    def __init__(self, mha, wrap):
+        super().__init__()
+        if not mha.batch_first or not mha._qkv_same_embed_dim or mha.bias_k is not None:
+            raise ValueError('QKVAttention supports batch_first self-attention without bias_k/bias_v')
+        d = mha.embed_dim
+        self.num_heads = mha.num_heads
+        self.dropout = mha.dropout
+        projs = []
+        for i in range(3):
+            proj = nn.Linear(d, d, bias=mha.in_proj_bias is not None)
+            with torch.no_grad():
+                proj.weight.copy_(mha.in_proj_weight[i * d:(i + 1) * d])
+                if proj.bias is not None:
+                    proj.bias.copy_(mha.in_proj_bias[i * d:(i + 1) * d])
+            projs.append(wrap(proj))
+        self.q_proj, self.k_proj, self.v_proj = projs
+        # Plain Linear rather than MHA's NonDynamicallyQuantizableLinear subclass, so PAI tracks it.
+        self.out_proj = nn.Linear(d, d, bias=mha.out_proj.bias is not None)
+        self.out_proj.load_state_dict(mha.out_proj.state_dict())
+
+    def forward(self, query, key, value, need_weights=False):
+        # Same call signature as nn.MultiheadAttention, so EncoderBlock.forward is unchanged.
+        if need_weights:
+            raise ValueError('QKVAttention does not return attention weights')
+        b, n, d = query.shape
+        h = self.num_heads
+
+        def heads(t):
+            return t.view(b, n, h, d // h).transpose(1, 2)
+
+        q, k, v = heads(self.q_proj(query)), heads(self.k_proj(key)), heads(self.v_proj(value))
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        return self.out_proj(x.transpose(1, 2).reshape(b, n, d)), None
 
 
 def add_arguments(parser):
     group = parser.add_argument_group('PerforatedAI')
     group.add_argument('--pai-layers', nargs='*', type=int, default=None, metavar='I',
-                       help='0-indexed encoder layers whose MLP gets dendrites, e.g. 3 7 11. '
+                       help='0-indexed encoder layers whose --pai-target gets dendrites, e.g. 3 7 11. '
                             'Enables PAI fine-tuning; requires --pai-init.')
     group.add_argument('--pai-target', default='mlp', choices=sorted(TARGETS),
                        help='perforate the whole MLP block, the MLP with its pre-norm ln_2, '
-                            'or only its first/second Linear')
+                            'only its first/second Linear, or the attention q/k/v projections')
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
@@ -90,7 +136,9 @@ def perforate(model, args):
         block = model.encoder.layers[i]
         mlp = block.mlp
         index = TARGETS[args.pai_target]
-        if args.pai_target == 'ln_mlp':
+        if args.pai_target == 'qkv':
+            block.self_attention = QKVAttention(block.self_attention, lambda m: GPA.PAISequential([m]))
+        elif args.pai_target == 'ln_mlp':
             # forward() computes mlp(ln_2(x)), so moving ln_2 inside the wrapper keeps the math.
             block.mlp = GPA.PAISequential([block.ln_2, mlp])
             block.ln_2 = nn.Identity()
@@ -107,7 +155,8 @@ def perforate(model, args):
     if args.pai_initial_correlation_batches is not None:
         pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
     # Dendrites only on the wrapped targets. Everything else is tracked as a whole module, so
-    # PAI never wraps the Linear that nn.MultiheadAttention uses internally.
+    # PAI never wraps the Linear that nn.MultiheadAttention uses internally. QKVAttention itself
+    # is a container; its unwrapped out_proj is tracked as a Linear.
     pc.set_modules_to_perforate([GPA.PAISequential])
     pc.set_module_names_to_perforate(['PAISequential'])
     pc.set_modules_to_track([nn.MultiheadAttention, nn.LayerNorm, nn.Conv2d, nn.Linear])

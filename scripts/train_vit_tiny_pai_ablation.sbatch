@@ -17,7 +17,8 @@
 #   task 2: dendrites on the MLP of encoder layer 7  (8th block)
 #   task 3: dendrites on the MLP of encoder layer 11 (12th block)
 # Override at submission, e.g. sbatch --export=ALL,EPOCHS=20,MAX_DENDRITES=1 ...
-# PAI_TARGET=ln_mlp also wraps each block's pre-norm ln_2 with its MLP. The control adds no
+# PAI_TARGET=ln_mlp also wraps each block's pre-norm ln_2 with its MLP; PAI_TARGET=qkv instead
+# puts dendrites on the attention q, k and v projections of each layer. The control adds no
 # dendrites, so its result does not depend on PAI_TARGET; skip it with --array=1-3.
 
 set -euo pipefail
