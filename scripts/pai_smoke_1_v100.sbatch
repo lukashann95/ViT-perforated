@@ -15,6 +15,7 @@
 #   task 0: control arm (--pai-control)
 #   task 1: dendrites on encoder layer 11
 # Pass: the log shows "PAI restructured the model" (task 1) and the job exits 0.
+# Test another target with sbatch --export=ALL,PAI_TARGET=qkv (see --pai-target in pai_setup.py).
 
 set -euo pipefail
 
@@ -34,10 +35,14 @@ else
     PAI_ARGS=(--pai-layers "$ARM")
 fi
 
+PAI_TARGET=${PAI_TARGET:-mlp}
+TARGET_TAG=""
+if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
+
 REPO="/ocean/projects/cis260364p/${USER}/ViT-perforated"
 SHARED=/ocean/projects/cis260364p/shared
 BASELINE="$SHARED/checkpoints/vit_tiny_amp_8v100_49682577/model_best.pth.tar"
-RUN_NAME="pai_smoke_${ARM}_${SLURM_ARRAY_JOB_ID}"
+RUN_NAME="pai_smoke_${ARM}${TARGET_TAG}_${SLURM_ARRAY_JOB_ID}"
 LOG_ROOT="$SHARED/logs"
 
 cd "$REPO"
@@ -63,6 +68,7 @@ uv run python -u main.py \
     --workers 5 \
     --pai-init "$BASELINE" \
     "${PAI_ARGS[@]}" \
+    --pai-target "$PAI_TARGET" \
     --max-dendrites 1 \
     --pai-n-epochs-to-switch 1 \
     --pai-p-epochs-to-switch 1 \
