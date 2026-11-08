@@ -18,6 +18,7 @@
 # Debug overrides, e.g. sbatch --array=1 --export=ALL,AMP=0,CAND_CLIP=1.0 ...
 #   AMP=0         train in fp32 instead of fp16 autocast
 #   CAND_CLIP=X   pass --pai-candidate-grad-clipping X
+#   BATCH=N       batch size (default 1024; fp32 at 1024 runs out of memory)
 
 set -euo pipefail
 
@@ -42,6 +43,7 @@ SHARED=/ocean/projects/cis260364p/shared
 BASELINE="$SHARED/checkpoints/vit_tiny_amp_8v100_49682577/model_best.pth.tar"
 AMP=${AMP:-1}
 CAND_CLIP=${CAND_CLIP:-}
+BATCH=${BATCH:-1024}
 EXTRA_ARGS=()
 if [ "$AMP" = 1 ]; then EXTRA_ARGS+=(--amp); fi
 if [ -n "$CAND_CLIP" ]; then EXTRA_ARGS+=(--pai-candidate-grad-clipping "$CAND_CLIP"); fi
@@ -61,7 +63,7 @@ uv run python -u main.py \
     --num-layers 12 \
     --num-heads 3 \
     --patch-size 16 \
-    --batch-size 1024 \
+    --batch-size "$BATCH" \
     --accum-freq 1 \
     --mlp-head \
     --lr 1e-4 \
