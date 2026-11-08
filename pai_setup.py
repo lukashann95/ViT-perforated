@@ -29,6 +29,25 @@ def _import_pai():
     from perforatedai import utils_perforatedai
     GPA, UPA = globals_perforatedai, utils_perforatedai
 
+
+def _dendrites_in_fp32():
+    # Under fp16 autocast, perforatedai 4.0.0 produces NaN/inf candidate outputs on the first
+    # dendrite-phase forward pass. Run the dendrite and candidate forward in fp32; the rest of
+    # the network stays fp16. Full fp32 at batch 1024 does not fit on a 32 GB V100.
+    from perforatedai import modules_perforatedai
+    cls = modules_perforatedai.PAIDendriteModule
+    if getattr(cls.forward, '_fp32', False):
+        return
+    forward = cls.forward
+
+    def fp32_forward(self, *args, **kwargs):
+        args = [a.float() if torch.is_tensor(a) and a.is_floating_point() else a for a in args]
+        with torch.autocast(device_type='cuda', enabled=False):
+            return forward(self, *args, **kwargs)
+
+    fp32_forward._fp32 = True
+    cls.forward = fp32_forward
+
 # Submodule of torchvision's MLPBlock to perforate: Linear(D, 4D), GELU, Dropout, Linear(4D, D), Dropout.
 # 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP.
 TARGETS = {'mlp': None, 'ln_mlp': None, 'fc1': 0, 'fc2': 3}
@@ -88,6 +107,8 @@ def load_init(model, path):
 
 def perforate(model, args):
     _import_pai()
+    if args.amp:
+        _dendrites_in_fp32()
     for i in args.pai_layers:
         block = model.encoder.layers[i]
         mlp = block.mlp
