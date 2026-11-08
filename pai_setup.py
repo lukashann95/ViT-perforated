@@ -57,6 +57,8 @@ def add_arguments(parser):
                             "must be below --log-steps")
     group.add_argument('--pai-patience', default=2, type=int,
                        help='ReduceLROnPlateau patience, in validations')
+    group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
+                       help='clip candidate dendrite gradients to this norm (PAI default: off)')
 
 
 def check_args(parser, args):
@@ -106,6 +108,8 @@ def perforate(model, args):
     pc.set_p_epochs_to_switch(args.pai_p_epochs_to_switch)
     if args.pai_initial_correlation_batches is not None:
         pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
+    if args.pai_candidate_grad_clipping is not None:
+        pc.set_candidate_grad_clipping(args.pai_candidate_grad_clipping)
     # Dendrites only on the wrapped targets. Everything else is tracked as a whole module, so
     # PAI never wraps the Linear that nn.MultiheadAttention uses internally.
     pc.set_modules_to_perforate([GPA.PAISequential])

@@ -15,6 +15,9 @@
 #   task 0: control arm (--pai-control)
 #   task 1: dendrites on encoder layer 11
 # Pass: the log shows "PAI restructured the model" (task 1) and the job exits 0.
+# Debug overrides, e.g. sbatch --array=1 --export=ALL,AMP=0,CAND_CLIP=1.0 ...
+#   AMP=0         train in fp32 instead of fp16 autocast
+#   CAND_CLIP=X   pass --pai-candidate-grad-clipping X
 
 set -euo pipefail
 
@@ -37,6 +40,12 @@ fi
 REPO="/ocean/projects/cis260364p/${USER}/ViT-perforated"
 SHARED=/ocean/projects/cis260364p/shared
 BASELINE="$SHARED/checkpoints/vit_tiny_amp_8v100_49682577/model_best.pth.tar"
+AMP=${AMP:-1}
+CAND_CLIP=${CAND_CLIP:-}
+EXTRA_ARGS=()
+if [ "$AMP" = 1 ]; then EXTRA_ARGS+=(--amp); fi
+if [ -n "$CAND_CLIP" ]; then EXTRA_ARGS+=(--pai-candidate-grad-clipping "$CAND_CLIP"); fi
+
 RUN_NAME="pai_smoke_${ARM}_${SLURM_ARRAY_JOB_ID}"
 LOG_ROOT="$SHARED/logs"
 
@@ -54,7 +63,6 @@ uv run python -u main.py \
     --patch-size 16 \
     --batch-size 1024 \
     --accum-freq 1 \
-    --amp \
     --mlp-head \
     --lr 1e-4 \
     --max-steps 30 \
@@ -63,6 +71,7 @@ uv run python -u main.py \
     --workers 5 \
     --pai-init "$BASELINE" \
     "${PAI_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}" \
     --max-dendrites 1 \
     --pai-n-epochs-to-switch 1 \
     --pai-p-epochs-to-switch 1 \
