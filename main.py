@@ -30,6 +30,7 @@ from torch.utils.data import Subset
 import wandb
 
 import pai_setup
+from pai_images import PAIImages
 from simple_vit import SimpleVisionTransformer
 from transforms import TwoHotMixUp, TFInceptionCrop, RandAugment17
 
@@ -563,6 +564,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     )
 
     if args.pai:
+        pai_images = PAIImages(args.log_dir)
         if not args.pai_control:
             # PAI records tensor shapes on the first training backward pass and cannot switch
             # without one. Run one microbatch with no optimizer step.
@@ -580,8 +582,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         model.train()
         if restructured:
             optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+        image_data = pai_images.collect(start_step, wandb if args.wandb and is_primary(args) else None)
         if args.wandb and is_primary(args):
-            wandb.log(pai_setup.stats(), step=start_step)
+            wandb.log({**pai_setup.stats(), **image_data}, step=start_step)
 
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
@@ -664,7 +667,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "l2_grads": l2_grads.item(),
                     "l2_params": math.sqrt(l2_params)
                 }
-                wandb.log(log_data, step=step)
+                # Keep this step open for validation, PAI stats and plots.
+                pai_validation = args.pai and (step % args.log_steps == 0 or step in args.specified_steps)
+                wandb.log(log_data, step=step, commit=not pai_validation)
             interval_correct = 0.0
             interval_loss_sum = 0.0
             interval_samples = 0
@@ -692,8 +697,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 if restructured:
                     print(f"=> PAI restructured the model at step {step}")
                     optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+                image_data = pai_images.collect(step, wandb if args.wandb and is_primary(args) else None)
                 if args.wandb and is_primary(args):
-                    wandb.log(pai_setup.stats(), step=step)
+                    wandb.log({**pai_setup.stats(), **image_data}, step=step)
 
             if is_primary(args):
                 ckpt = {
@@ -774,7 +780,8 @@ def validate(val_loader, model, step, device, args):
             'val/acc@1': top1.avg,
             'val/acc@5': top5.avg,
         }
-        wandb.log(log_data, step=step)
+        # PAI adds stats and images to the same step immediately after validation.
+        wandb.log(log_data, step=step, commit=not (args.pai and not args.evaluate))
 
     return top1.avg
 
