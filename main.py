@@ -2,7 +2,6 @@
 
 import argparse
 import builtins
-import functools
 import math
 import os
 import random
@@ -156,8 +155,14 @@ pai_setup.add_arguments(parser)
 best_acc1 = 0
 
 
-def collate(batch, mixup):
-    return mixup(*torch.utils.data.default_collate(batch))
+def normalize(images):
+    """uint8 [0, 255] -> float32 [-1, 1]: ToDtype(scale=True) followed by Normalize(0.5, 0.5).
+
+    Loader workers ship uint8 images, a quarter of the host memory of float32 batches, and
+    the conversion runs on the device. MixUp is linear and its weights sum to 1, so mixing
+    after normalizing gives the same result as mixing normalized images in the workers.
+    """
+    return images.float().div_(255).sub_(0.5).div_(0.5)
 
 
 def chunk(n, device, *tensors):
@@ -341,17 +346,11 @@ def main_worker(gpu, args):
     if args.fake_data:
         print("=> Fake data is used!")
         input_shape = (3, args.input_resolution, args.input_resolution)
-        transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-        ])
+        # uint8 images; normalize() converts them on the device.
+        transform = v2.ToImage()
         train_dataset = datasets.FakeData(1281167, input_shape, 1000, transform)
         val_dataset = datasets.FakeData(50000, input_shape, 1000, transform)
     else:
-        value_range = v2.Normalize(
-            mean=[0.5] * 3,
-            std=[0.5] * 3)
-
         cutout_const = 40
         translate_const = 100
         MAX_LEVEL = 10
@@ -391,10 +390,7 @@ def main_worker(gpu, args):
         ]
         if args.randaug:
             transform.append(randaug)
-        transform.extend([
-            v2.ToDtype(torch.float32, scale=True),
-            value_range
-        ])
+        # Workers return uint8 images; normalize() converts them on the device.
 
         train_dataset = datasets.ImageFolder(
             os.path.join(args.data, 'train'),
@@ -406,8 +402,6 @@ def main_worker(gpu, args):
                 v2.ToImage(),
                 v2.Resize(256),
                 v2.CenterCrop(args.input_resolution),
-                v2.ToDtype(torch.float32, scale=True),
-                value_range,
             ]))
 
     if args.train_fraction < 1:
@@ -452,13 +446,10 @@ def main_worker(gpu, args):
         train_sampler = None
         val_sampler = None
 
-    mixup = TwoHotMixUp(alpha=args.mixup_alpha, prefetch_factor=args.prefetch_factor, batch_size=args.batch_size)
-    collate_fn = functools.partial(collate, mixup=mixup)
-
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.prefetch_factor * args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler,
-        collate_fn=collate_fn, drop_last=True, multiprocessing_context='spawn',
+        drop_last=True, multiprocessing_context='spawn',
         prefetch_factor=1, persistent_workers=True)
 
     val_loader = torch.utils.data.DataLoader(
@@ -555,13 +546,16 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     model.train()
     end = time.time()
     best_acc1 = 0
-    # generator moves data to the same device as model
-    gen = (
-        (images, lam, target1, target2) for (img, lam, trt1, trt2) in infinite_loader(train_loader, train_sampler) for images, target1, target2 in zip(
-            img.to(device, non_blocking=True),
-            trt1.to(device, non_blocking=True),
-            trt2.to(device, non_blocking=True))
-    )
+    mixup = TwoHotMixUp(alpha=args.mixup_alpha, prefetch_factor=args.prefetch_factor, batch_size=args.batch_size)
+
+    def train_batches():
+        # Move uint8 batches to the device, then normalize and mix up there.
+        for img, target in infinite_loader(train_loader, train_sampler):
+            img = normalize(img.to(device, non_blocking=True))
+            img, lam, trt1, trt2 = mixup(img, target.to(device, non_blocking=True))
+            yield from ((images, lam, target1, target2) for images, target1, target2 in zip(img, trt1, trt2))
+
+    gen = train_batches()
 
     if args.pai:
         pai_images = PAIImages(args.log_dir)
@@ -732,7 +726,7 @@ def validate(val_loader, model, step, device, args):
                 for img, trt in chunk(args.accum_freq, device, images, target):
                     # compute output
                     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=args.amp):
-                        output, loss = model(img, 1.0, trt, trt)
+                        output, loss = model(normalize(img), 1.0, trt, trt)
 
                     # measure accuracy and record loss
                     acc1, acc5 = accuracy(output, trt, topk=(1, 5))
