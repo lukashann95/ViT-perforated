@@ -219,7 +219,8 @@ def main():
         # PAI runs change into the log directory, so later paths must not depend on the cwd.
         args.data = os.path.abspath(args.data)
         args.logs = os.path.abspath(args.logs)
-        args.pai_init = os.path.abspath(args.pai_init)
+        if args.pai_init:
+            args.pai_init = os.path.abspath(args.pai_init)
 
     # get the name of the experiments
     if args.name is None:
@@ -295,7 +296,8 @@ def main_worker(gpu, args):
         register=args.register,
     )
     if args.pai:
-        pai_setup.load_init(model, args.pai_init)
+        if args.pai_init:
+            pai_setup.load_init(model, args.pai_init)
         # PAI writes its graphs, CSVs and saves to ./pai.
         os.chdir(args.log_dir)
         original_model = model = pai_setup.perforate(model, args)
@@ -559,6 +561,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
     if args.pai:
         pai_images = PAIImages(args.log_dir)
+    if args.pai and args.pai_init:
         if not args.pai_control:
             # PAI records tensor shapes on the first training backward pass and cannot switch
             # without one. Run one microbatch with no optimizer step.
@@ -583,6 +586,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
         data_time.update(time.time() - end)
+        if args.pai and step <= args.pai_warmup:
+            pai_setup.warmup_lr(optimizer, args, step)
         step_loss = 0.0
         step_correct = 0.0
 

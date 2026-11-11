@@ -1,6 +1,7 @@
 """PerforatedAI (Perforated Backpropagation) support for main.py.
 
-Fine-tunes a trained SimpleVisionTransformer with dendrites on selected encoder MLPs.
+Adds dendrites to selected encoder MLPs of a SimpleVisionTransformer, either fine-tuning a
+trained checkpoint (--pai-init) or training from scratch (no --pai-init, usually with --pai-warmup).
 PAI is imported only when --pai-layers is set, so baseline runs need neither the package
 nor PAI credentials. PAI reads PAIEMAIL and PAITOKEN from the environment.
 
@@ -57,14 +58,18 @@ def add_arguments(parser):
     group = parser.add_argument_group('PerforatedAI')
     group.add_argument('--pai-layers', nargs='*', type=int, default=None, metavar='I',
                        help='0-indexed encoder layers whose MLP gets dendrites, e.g. 3 7 11. '
-                            'Enables PAI fine-tuning; requires --pai-init.')
+                            'Enables PAI; fine-tunes --pai-init if given, else trains from scratch.')
     group.add_argument('--pai-target', default='mlp', choices=sorted(TARGETS),
                        help='perforate the whole MLP block, the MLP with its pre-norm ln_2, '
                             'or only its first/second Linear')
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
-                       help='trained checkpoint (main.py format) to fine-tune from')
+                       help='trained checkpoint (main.py format) to fine-tune from; '
+                            'omit to train from random initialization')
+    group.add_argument('--pai-warmup', default=0, type=int, metavar='STEPS',
+                       help='linear LR warmup from 0 to --lr over the first STEPS optimizer steps. '
+                            'PAI owns the scheduler, so --warmup does not apply to PAI runs.')
     group.add_argument('--max-dendrites', default=1, type=int,
                        help='maximum dendrite rounds PAI may add')
     group.add_argument('--pai-n-epochs-to-switch', default=10, type=int,
@@ -86,8 +91,8 @@ def check_args(parser, args):
         return
     if not args.pai_layers:
         parser.error('--pai-layers needs at least one layer index')
-    if not args.pai_init:
-        parser.error('--pai-layers requires --pai-init')
+    if args.pai_warmup < 0:
+        parser.error('--pai-warmup must be non-negative')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
         parser.error(f'--pai-layers must be in [0, {args.num_layers})')
     if args.distributed or args.ngpus_per_node > 1:
@@ -163,6 +168,14 @@ def add_score(model, acc1, args, device, force_switch=False):
     model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
         100 * acc1, model, force_switch=force_switch)
     return model.to(device), bool(restructured), training_complete
+
+
+def warmup_lr(optimizer, args, step):
+    # ReduceLROnPlateau only lowers the LR at validations, and PAI rebuilds the optimizer only
+    # after a phase switch, so overwriting the LR for the first steps is safe as long as the
+    # warmup ends before the first plateau or switch (warmup < pai_n_epochs_to_switch epochs).
+    for group in optimizer.param_groups:
+        group['lr'] = args.lr * step / args.pai_warmup
 
 
 def in_dendrite_phase():
