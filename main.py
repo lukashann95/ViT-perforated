@@ -221,6 +221,8 @@ def main():
         args.logs = os.path.abspath(args.logs)
         if args.pai_init:
             args.pai_init = os.path.abspath(args.pai_init)
+        if args.pai_resume:
+            args.pai_resume = os.path.abspath(args.pai_resume)
 
     # get the name of the experiments
     if args.name is None:
@@ -298,9 +300,13 @@ def main_worker(gpu, args):
     if args.pai:
         if args.pai_init:
             pai_setup.load_init(model, args.pai_init)
+        if args.pai_resume:
+            pai_resume = pai_setup.load_resume(model, args.pai_resume)
         # PAI writes its graphs, CSVs and saves to ./pai.
         os.chdir(args.log_dir)
         original_model = model = pai_setup.perforate(model, args)
+        if args.pai_resume:
+            pai_setup.restore_tracker(model, pai_resume, args)
 
     wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
     non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -466,6 +472,8 @@ def main_worker(gpu, args):
             scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [args.warmup])
 
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    if args.pai and args.pai_resume:
+        pai_setup.restore_training(optimizer, scheduler, scaler, pai_resume, args)
 
     # optionally resume from a checkpoint
     if args.resume:

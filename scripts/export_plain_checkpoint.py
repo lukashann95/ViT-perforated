@@ -11,31 +11,13 @@ perforation arms from one neuron-phase checkpoint.
 """
 import argparse
 import os
-import re
 import sys
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from pai_setup import plain_state_dict  # noqa: E402
 from simple_vit import SimpleVisionTransformer  # noqa: E402
-
-
-def plain_key(key, target):
-    """Map one PAI state_dict key to the plain model's key, or None for PAI bookkeeping."""
-    if key == 'tracker_string' or '.dendrite_module.' in key or key.endswith(
-            ('.this_output_dimensions', '.this_node_index')):
-        return None
-    key = key.replace('.main_module.', '.')
-    # The perforated target is wrapped as PAISequential([...]) -> '<module>.model.<i>.'.
-    if target == 'mlp':
-        key = re.sub(r'\.mlp\.model\.0\.', '.mlp.', key)
-    elif target == 'ln_mlp':
-        # PAISequential([ln_2, mlp]) replaced mlp, and ln_2 became Identity.
-        key = re.sub(r'\.mlp\.model\.0\.', '.ln_2.', key)
-        key = re.sub(r'\.mlp\.model\.1\.', '.mlp.', key)
-    else:  # fc1 / fc2: mlp[i] = PAISequential([Linear])
-        key = re.sub(r'\.mlp\.(\d+)\.model\.0\.', r'.mlp.\1.', key)
-    return key
 
 
 def main():
@@ -53,14 +35,7 @@ def main():
 
     checkpoint = torch.load(args.src, map_location='cpu', weights_only=True)
     source = checkpoint['state_dict']
-    state = {}
-    for key, value in source.items():
-        new = plain_key(key, args.pai_target)
-        if new is None:
-            continue
-        if new in state:
-            sys.exit(f'two PAI keys map to {new}')
-        state[new] = value
+    state = plain_state_dict(source, args.pai_target)
 
     model = SimpleVisionTransformer(
         image_size=args.input_resolution, patch_size=args.patch_size, num_layers=args.num_layers,

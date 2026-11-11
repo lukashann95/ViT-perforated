@@ -1,7 +1,8 @@
 """PerforatedAI (Perforated Backpropagation) support for main.py.
 
 Adds dendrites to selected encoder MLPs of a SimpleVisionTransformer, either fine-tuning a
-trained checkpoint (--pai-init) or training from scratch (no --pai-init, usually with --pai-warmup).
+trained checkpoint (--pai-init), training from scratch (usually with --pai-warmup), or resuming a
+PAI run's neuron phase with its full tracker, optimizer and scheduler state (--pai-resume).
 PAI is imported only when --pai-layers is set, so baseline runs need neither the package
 nor PAI credentials. PAI reads PAIEMAIL and PAITOKEN from the environment.
 
@@ -9,6 +10,8 @@ PAI writes its graphs, CSVs and model saves to ./pai, so main.py changes into th
 log directory before calling perforate().
 """
 import pdb
+import re
+import time
 
 import torch
 import torch.nn as nn
@@ -67,6 +70,11 @@ def add_arguments(parser):
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
                        help='trained checkpoint (main.py format) to fine-tune from; '
                             'omit to train from random initialization')
+    group.add_argument('--pai-resume', default='', type=str, metavar='PATH',
+                       help='main.py checkpoint of a PAI run saved before its first switch. '
+                            'Continues that run (step, tracker history, optimizer, LR scheduler) '
+                            'with this run\'s --pai-layers/--pai-target/--pai-control, so PAI '
+                            'decides the first switch itself.')
     group.add_argument('--pai-warmup', default=0, type=int, metavar='STEPS',
                        help='linear LR warmup from 0 to --lr over the first STEPS optimizer steps. '
                             'PAI owns the scheduler, so --warmup does not apply to PAI runs.')
@@ -93,6 +101,8 @@ def check_args(parser, args):
         parser.error('--pai-layers needs at least one layer index')
     if args.pai_warmup < 0:
         parser.error('--pai-warmup must be non-negative')
+    if args.pai_resume and args.pai_init:
+        parser.error('--pai-resume and --pai-init are mutually exclusive')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
         parser.error(f'--pai-layers must be in [0, {args.num_layers})')
     if args.distributed or args.ngpus_per_node > 1:
@@ -102,6 +112,110 @@ def check_args(parser, args):
     if args.accum_freq != 1:
         # PAI stores one set of dendrite outputs and neuron errors per optimizer step.
         parser.error('PAI runs need --accum-freq 1')
+
+
+def plain_key(key, target):
+    """Map one key of a perforated model's state_dict to the plain model's key.
+
+    Returns None for PAI bookkeeping (tracker_string, dendrite_module.*, shape buffers). Neuron
+    weights only: dendrite weights, if any, are dropped too.
+    """
+    if key == 'tracker_string' or '.dendrite_module.' in key or key.endswith(
+            ('.this_output_dimensions', '.this_node_index')):
+        return None
+    key = key.replace('.main_module.', '.')
+    # The perforated target is wrapped as PAISequential([...]) -> '<module>.model.<i>.'.
+    if target == 'mlp':
+        key = re.sub(r'\.mlp\.model\.0\.', '.mlp.', key)
+    elif target == 'ln_mlp':
+        # PAISequential([ln_2, mlp]) replaced mlp, and ln_2 became Identity.
+        key = re.sub(r'\.mlp\.model\.0\.', '.ln_2.', key)
+        key = re.sub(r'\.mlp\.model\.1\.', '.mlp.', key)
+    else:  # fc1 / fc2: mlp[i] = PAISequential([Linear])
+        key = re.sub(r'\.mlp\.(\d+)\.model\.0\.', r'.mlp.\1.', key)
+    return key
+
+
+def detect_target(state_dict):
+    """The --pai-target a perforated state_dict was saved with."""
+    keys = [k.replace('.main_module.', '.') for k in state_dict]
+    if any('.mlp.model.1.' in k for k in keys):
+        return 'ln_mlp'
+    if any('.mlp.model.0.' in k for k in keys):
+        return 'mlp'
+    return 'fc1'  # fc1 and fc2 map identically
+
+
+def plain_state_dict(state_dict, target=None):
+    target = target or detect_target(state_dict)
+    plain = {}
+    for key, value in state_dict.items():
+        new = plain_key(key, target)
+        if new is None:
+            continue
+        if new in plain:
+            raise ValueError(f'two perforated keys map to {new}')
+        plain[new] = value
+    return plain
+
+
+def tracker_string(checkpoint):
+    tensor = checkpoint['state_dict']['tracker_string']
+    return ''.join(map(chr, tensor.tolist()))
+
+
+def tracker_value(string, name):
+    for line in string.splitlines():
+        if line.startswith(name + ','):
+            return line.split(',', 1)[1]
+    raise KeyError(name)
+
+
+def load_resume(model, path):
+    """Load the neuron weights of a pre-switch PAI checkpoint into the unperforated model.
+
+    The weights may come from a run that perforated other layers: before the first switch the
+    wrapping is bookkeeping only. Returns the checkpoint for restore_tracker/restore_training.
+    """
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    string = tracker_string(checkpoint)
+    mode, dendrites = tracker_value(string, 'mode'), int(tracker_value(string, 'num_dendrites_added'))
+    if mode != 'n' or dendrites:
+        raise ValueError(f"--pai-resume needs a checkpoint from before the first switch; '{path}' "
+                         f"is in mode {mode} with {dendrites} dendrites")
+    model.load_state_dict(plain_state_dict(checkpoint['state_dict']), strict=True)
+    print(f"=> resuming PAI neuron phase from '{path}' (step {checkpoint['step']}, "
+          f"epoch {tracker_value(string, 'num_epochs_run')}, "
+          f"last improved epoch {tracker_value(string, 'epoch_last_improved')})")
+    return checkpoint
+
+
+def restore_tracker(model, checkpoint, args):
+    """Restore PAI's tracker from the checkpoint, after perforate().
+
+    Follows UPA.load_system, minus its reset of current_best_validation_score and
+    epoch_last_improved: those restart PAI's countdown to the next switch, while this resume
+    continues it, so PAI switches when the original run would have.
+    """
+    tracker = GPA.pai_tracker
+    tracker.reset_module_vector(model, False)
+    tracker.from_string(tracker_string(checkpoint))
+    # Run identity comes from this run's flags, not the source run (e.g. a control arm).
+    tracker.member_vars['doing_pai'] = not args.pai_control
+    tracker.saved_time = time.time()
+    tracker.loaded = True
+    # PAI saves before the next epoch starts; load_system calls this to fix the off-by-one.
+    tracker.start_epoch(internal_call=True)
+
+
+def restore_training(optimizer, scheduler, scaler, checkpoint, args):
+    """Restore optimizer, LR scheduler and GradScaler state; set the resume step."""
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    scheduler.load_state_dict(checkpoint['scheduler'])
+    if args.amp and checkpoint.get('scaler'):
+        scaler.load_state_dict(checkpoint['scaler'])
+    args.start_step = checkpoint['step']
+    print(f"=> resumed at step {args.start_step}, lr {optimizer.param_groups[0]['lr']:.3g}")
 
 
 def load_init(model, path):
