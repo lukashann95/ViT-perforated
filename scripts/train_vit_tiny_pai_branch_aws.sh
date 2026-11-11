@@ -1,25 +1,38 @@
 #!/bin/bash
-# PerforatedAI arms branched from one neuron-phase checkpoint, single T4 (AWS g4dn.xlarge).
-# PAI_INIT must be a plain checkpoint exported with scripts/export_plain_checkpoint.py from a
-# from-scratch PAI run (train_vit_tiny_pai_scratch_aws.sh) before its first switch:
-#   PAI_INIT=init.pth.tar ./train_vit_tiny_pai_branch_aws.sh 7        dendrites on layer 7's MLP
-#   PAI_INIT=init.pth.tar ./train_vit_tiny_pai_branch_aws.sh control  same wrapping, no dendrites
-# Dendrite arms switch into a dendrite phase immediately; the control keeps training the neurons.
-# Same data, batch and LR as the from-scratch run. No warmup: the from-scratch run's switch also
-# rebuilds the optimizer at the full LR. EPOCHS is only a safety cap; PAI ends the run itself.
+# PerforatedAI arms branched from one neuron-phase checkpoint of a from-scratch PAI run
+# (train_vit_tiny_pai_scratch_aws.sh), single T4 (AWS g4dn.xlarge). Two ways to branch:
+#
+#   PAI_RESUME=ckpt ./train_vit_tiny_pai_branch_aws.sh 7
+#       ckpt is the run's own main.py checkpoint from before its first switch. Continues that run
+#       (step, PAI tracker, optimizer, LR scheduler) with dendrites on layer 7, so PAI decides the
+#       switch itself. EPOCHS is the total including the shared epochs (default 250).
+#   PAI_INIT=plain.pth.tar ./train_vit_tiny_pai_branch_aws.sh 7
+#       plain checkpoint from scripts/export_plain_checkpoint.py. Fresh tracker; dendrite arms are
+#       forced into a dendrite phase immediately. EPOCHS counts from 0 (default 250).
+#
+# ARM "control" keeps layer 11's wrapping without ever adding dendrites. Same data, batch and LR
+# as the from-scratch run. EPOCHS is only a safety cap; PAI ends the run itself.
 
 set -euo pipefail
 
-ARM=${1:?usage: PAI_INIT=ckpt $0 <layer index|control>}
-: "${PAI_INIT:?set PAI_INIT to a plain checkpoint (scripts/export_plain_checkpoint.py)}"
-PAI_INIT=$(realpath "$PAI_INIT")
+ARM=${1:?usage: PAI_RESUME=ckpt|PAI_INIT=ckpt $0 <layer index|control>}
+if [ -n "${PAI_RESUME:-}" ]; then
+    START=(--pai-resume "$(realpath "$PAI_RESUME")")
+    KIND=resume
+elif [ -n "${PAI_INIT:-}" ]; then
+    START=(--pai-init "$(realpath "$PAI_INIT")")
+    KIND=branch
+else
+    echo "set PAI_RESUME (pre-switch main.py checkpoint) or PAI_INIT (plain checkpoint)" >&2
+    exit 1
+fi
 if [ "$ARM" = control ]; then
     PAI_ARGS=(--pai-layers 11 --pai-control)
 else
     PAI_ARGS=(--pai-layers "$ARM")
 fi
 
-EPOCHS=${EPOCHS:-400}
+EPOCHS=${EPOCHS:-250}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
 PAI_TARGET=${PAI_TARGET:-mlp}
 TARGET_TAG=""
@@ -28,7 +41,7 @@ if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGENET=${IMAGENET:-$HOME/data/imagenet}
 LOG_ROOT=${LOG_ROOT:-$HOME/runs}
-RUN_NAME="vit_tiny_pai_branch_${ARM}${TARGET_TAG}_20pct_$(date +%Y%m%d_%H%M)"
+RUN_NAME="vit_tiny_pai_${KIND}_${ARM}${TARGET_TAG}_20pct_$(date +%Y%m%d_%H%M)"
 
 if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
 : "${PAIEMAIL:?PAIEMAIL is not set; create ~/.pai_env}"
@@ -36,7 +49,7 @@ if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
 
 test -d "$IMAGENET/train"
 test -d "$IMAGENET/val"
-test -r "$PAI_INIT"
+test -r "${START[1]}"
 mkdir -p "$LOG_ROOT"
 
 export WANDB_DIR="$LOG_ROOT/$RUN_NAME"
@@ -66,7 +79,7 @@ cd "$REPO"
     --lr 5e-4 \
     --log-steps 500 \
     --workers 4 \
-    --pai-init "$PAI_INIT" \
+    "${START[@]}" \
     "${PAI_ARGS[@]}" \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
