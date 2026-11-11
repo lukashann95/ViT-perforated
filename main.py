@@ -149,10 +149,35 @@ parser.add_argument('--name', default=None, type=str,
                          'Otherwise use current time.')
 parser.add_argument("--report-to", default='', type=str,
                     help="Options are ['wandb']")
+parser.add_argument("--wandb-history-from", default='', type=str, metavar='RUN_ID',
+                    help="W&B run (same entity/project) whose logged scalars up to the resume step "
+                         "are copied into this run first, e.g. the run a --pai-resume checkpoint "
+                         "came from. W&B's own run forking is a private preview feature.")
 parser.add_argument("--wandb-notes", default='', type=str,
                     help="Notes if logging with wandb")
 pai_setup.add_arguments(parser)
 best_acc1 = 0
+
+
+def copy_wandb_history(run_id, last_step):
+    """Copy the scalars run_id logged up to last_step into the current W&B run.
+
+    Stands in for W&B run forking, which is a private preview feature: charts of a resumed run
+    then start at step 0. Media (e.g. PAI plots) are not copied; PAI's own plots already
+    include the restored history.
+    """
+    source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{wandb.run.project}/{run_id}")
+    rows = 0
+    for row in source.scan_history(page_size=1000):
+        step = row.get('_step')
+        if step is None or step > last_step:
+            continue
+        data = {k: v for k, v in row.items()
+                if not k.startswith('_') and v is not None and not isinstance(v, dict)}
+        if data:
+            wandb.log(data, step=step)
+            rows += 1
+    print(f"=> copied {rows} W&B history rows (steps <= {last_step}) from run '{run_id}'")
 
 
 def normalize(images):
@@ -510,6 +535,8 @@ def main_worker(gpu, args):
         )
         params_file = os.path.join(args.logs, args.name, "params.txt")
         wandb.save(params_file)
+        if args.wandb_history_from and args.start_step:
+            copy_wandb_history(args.wandb_history_from, args.start_step)
 
     # PAI replaces modules when it adds dendrites, so PAI runs stay uncompiled.
     if not args.pai:

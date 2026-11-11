@@ -16,9 +16,16 @@
 set -euo pipefail
 
 ARM=${1:?usage: PAI_RESUME=ckpt|PAI_INIT=ckpt $0 <layer index|control>}
+HISTORY=()
 if [ -n "${PAI_RESUME:-}" ]; then
     START=(--pai-resume "$(realpath "$PAI_RESUME")")
     KIND=resume
+    # Copy the source run's W&B history up to the resume step. main.py names the W&B run after
+    # the log directory, which holds the checkpoint under checkpoints/ or archive/<snapshot>/.
+    CKPT=$(realpath "$PAI_RESUME")
+    SRC_DIR=${CKPT%%/archive/*}
+    [ "$SRC_DIR" = "$CKPT" ] && SRC_DIR=${CKPT%%/checkpoints/*}
+    [ "$SRC_DIR" != "$CKPT" ] && HISTORY=(--wandb-history-from "$(basename "$SRC_DIR")")
 elif [ -n "${PAI_INIT:-}" ]; then
     START=(--pai-init "$(realpath "$PAI_INIT")")
     KIND=branch
@@ -80,6 +87,7 @@ cd "$REPO"
     --log-steps 500 \
     --workers 4 \
     "${START[@]}" \
+    ${HISTORY[@]+"${HISTORY[@]}"} \
     "${PAI_ARGS[@]}" \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
