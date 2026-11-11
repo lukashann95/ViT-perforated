@@ -5,10 +5,10 @@
 #   PAI_RESUME=ckpt ./train_vit_tiny_pai_branch_aws.sh 7
 #       ckpt is the run's own main.py checkpoint from before its first switch. Continues that run
 #       (step, PAI tracker, optimizer, LR scheduler) with dendrites on layer 7, so PAI decides the
-#       switch itself. EPOCHS is the total including the shared epochs (default 250).
+#       switch itself. EPOCHS is the total including the shared epochs (default 300).
 #   PAI_INIT=plain.pth.tar ./train_vit_tiny_pai_branch_aws.sh 7
 #       plain checkpoint from scripts/export_plain_checkpoint.py. Fresh tracker; dendrite arms are
-#       forced into a dendrite phase immediately. EPOCHS counts from 0 (default 250).
+#       forced into a dendrite phase immediately. EPOCHS counts from 0 (default 300).
 #
 # ARM "control" keeps layer 11's wrapping without ever adding dendrites. Same data, batch and LR
 # as the from-scratch run. EPOCHS is only a safety cap; PAI ends the run itself.
@@ -39,7 +39,7 @@ else
     PAI_ARGS=(--pai-layers "$ARM")
 fi
 
-EPOCHS=${EPOCHS:-250}
+EPOCHS=${EPOCHS:-300}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
 PAI_TARGET=${PAI_TARGET:-mlp}
 TARGET_TAG=""
