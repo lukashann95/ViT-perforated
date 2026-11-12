@@ -630,6 +630,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             pai_setup.warmup_lr(optimizer, args, step)
         step_loss = 0.0
         step_correct = 0.0
+        # The phase only changes at validations, so it is fixed for the whole step.
+        dendrite_phase = args.pai and pai_setup.in_dendrite_phase()
 
         for img, trt1, trt2 in chunk(args.accum_freq, device, images, target1, target2):
             # compute output
@@ -645,7 +647,12 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 interval_correct += batch_correct
 
             # compute gradient
-            scaler.scale(loss / args.accum_freq).backward()
+            if dendrite_phase:
+                # PAI's documented AMP pattern: a plain, unscaled backward in dendrite ('p')
+                # phases. PAI's dendrite correlation learning is not invariant to the loss scale.
+                (loss / args.accum_freq).backward()
+            else:
+                scaler.scale(loss / args.accum_freq).backward()
 
         step_loss /= args.accum_freq
         losses.update(step_loss, images.size(0))
@@ -653,20 +660,16 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         interval_loss_sum += step_loss * images.size(0)
         interval_samples += images.size(0)
 
-        if args.pai and pai_setup.in_dendrite_phase():
+        if dendrite_phase:
             # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
-            # during backward, so GradScaler has nothing to unscale, clip or inf-check. The
-            # gradients carry the constant loss scale, which AdamW's update is invariant to.
-            # Do GradScaler's overflow handling here instead: an fp16 overflow under the loss
-            # scale would otherwise turn the candidate dendrite weights into NaN.
+            # during the (unscaled) backward, so GradScaler is bypassed as PAI documents. Without
+            # loss scaling fp16 should not overflow; if it ever does, skip the update rather
+            # than let a non-finite error signal turn the candidate dendrite weights into NaN.
             l2_grads = torch.zeros((), device=device)
             if pai_setup.dendrite_grads_overflowed():
-                previous_scale = scaler.get_scale()
-                scaler.update(previous_scale * scaler.get_backoff_factor())
                 optimizer_updated = False
                 pai_setup.DIAG['last_scale_drop_step'] = step
-                print(f"=> fp16 overflow in dendrite step {step}: skipped the update, "
-                      f"loss scale {previous_scale:g} -> {scaler.get_scale():g}")
+                print(f"=> non-finite gradient in dendrite step {step}: skipped the update")
             else:
                 optimizer.step()
                 optimizer_updated = True
