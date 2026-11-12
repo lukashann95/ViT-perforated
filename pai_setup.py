@@ -241,8 +241,9 @@ def write_best_model(model, args):
     When PAI switches to dendrite training it reloads pai/best_model.pt (weights and tracker
     of the best epoch so far) and adds dendrites to that. A resumed run has not saved one yet,
     so rebuild the source run's best model: this model's state_dict structure, with every
-    neuron weight and the tracker taken from the source's best_model.pt. Call after
-    perforate() and restore_tracker(), with the run's log directory as cwd.
+    neuron weight and the tracker taken from the source's best_model.pt. Call after the first
+    training backward pass (PAI creates its dendrite buffers there), with the run's log
+    directory as cwd.
     """
     source = _load_pai_file(resume_best_model_path(args.pai_resume))
     best = plain_state_dict(source)
@@ -251,7 +252,7 @@ def write_best_model(model, args):
         # dendrite_module.parent_module.* is a second reference to the wrapped module's weights.
         name = plain_key(key.replace('.dendrite_module.parent_module.', '.main_module.'), args.pai_target)
         if name is None:
-            state[key] = value.clone()
+            state[key] = value.detach().cpu().clone()
             continue
         if name not in best or best[name].shape != value.shape:
             raise ValueError(f"source best model has no weight for '{key}' ('{name}')")

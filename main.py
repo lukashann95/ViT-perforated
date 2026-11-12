@@ -332,7 +332,6 @@ def main_worker(gpu, args):
         original_model = model = pai_setup.perforate(model, args)
         if args.pai_resume:
             pai_setup.restore_tracker(model, pai_resume, args)
-            pai_setup.write_best_model(model, args)
 
     wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
     non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -619,6 +618,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         if args.wandb and is_primary(args):
             wandb.log({**pai_setup.stats(), **image_data}, step=start_step)
 
+    # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
+    # the source run's best model (which PAI reloads at a switch) after its first step.
+    best_model_pending = args.pai and bool(args.pai_resume)
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -665,6 +667,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             scaler.update()
             optimizer_updated = scaler.get_scale() >= previous_scale
         optimizer.zero_grad()
+        if best_model_pending:
+            pai_setup.write_best_model(original_model, args)
+            best_model_pending = False
 
         # measure elapsed time
         batch_time.update(time.time() - end)
