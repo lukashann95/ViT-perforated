@@ -332,6 +332,7 @@ def main_worker(gpu, args):
         original_model = model = pai_setup.perforate(model, args)
         if args.pai_resume:
             pai_setup.restore_tracker(model, pai_resume, args)
+            pai_setup.write_best_model(model, args)
 
     wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
     non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]

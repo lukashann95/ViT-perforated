@@ -9,6 +9,8 @@ nor PAI credentials. PAI reads PAIEMAIL and PAITOKEN from the environment.
 PAI writes its graphs, CSVs and model saves to ./pai, so main.py changes into the run's
 log directory before calling perforate().
 """
+import json
+import os
 import pdb
 import re
 import time
@@ -206,6 +208,65 @@ def restore_tracker(model, checkpoint, args):
     tracker.loaded = True
     # PAI saves before the next epoch starts; load_system calls this to fix the off-by-one.
     tracker.start_epoch(internal_call=True)
+
+
+def resume_best_model_path(resume_path):
+    """PAI's best_model.pt saved with a --pai-resume checkpoint: <snapshot>/pai/ for archived
+    snapshots, <run>/pai/ for <run>/checkpoints/."""
+    folder = os.path.dirname(resume_path)
+    for candidate in (os.path.join(folder, 'pai', 'best_model.pt'),
+                      os.path.join(os.path.dirname(folder), 'pai', 'best_model.pt')):
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(f"no pai/best_model.pt next to '{resume_path}'; PAI reloads the best "
+                            "model when it switches, so a resume needs it")
+
+
+def _load_pai_file(path):
+    """A PAI save (safetensors state_dict), with tied weights restored as UPA.load_net does."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+    state = load_file(path)
+    with safe_open(path, framework='pt') as f:
+        metadata = f.metadata() or {}
+    for secondary, primary in json.loads(metadata.get('weight_tying', '{}')).items():
+        if primary in state:
+            state[secondary] = state[primary]
+    return state
+
+
+def write_best_model(model, args):
+    """Write pai/best_model.pt for a resumed run, in this run's wrapping.
+
+    When PAI switches to dendrite training it reloads pai/best_model.pt (weights and tracker
+    of the best epoch so far) and adds dendrites to that. A resumed run has not saved one yet,
+    so rebuild the source run's best model: this model's state_dict structure, with every
+    neuron weight and the tracker taken from the source's best_model.pt. Call after
+    perforate() and restore_tracker(), with the run's log directory as cwd.
+    """
+    source = _load_pai_file(resume_best_model_path(args.pai_resume))
+    best = plain_state_dict(source)
+    state, copied = {}, 0
+    for key, value in model.state_dict().items():
+        # dendrite_module.parent_module.* is a second reference to the wrapped module's weights.
+        name = plain_key(key.replace('.dendrite_module.parent_module.', '.main_module.'), args.pai_target)
+        if name is None:
+            state[key] = value.clone()
+            continue
+        if name not in best or best[name].shape != value.shape:
+            raise ValueError(f"source best model has no weight for '{key}' ('{name}')")
+        state[key] = best[name].clone()
+        copied += 1
+    state['tracker_string'] = source['tracker_string'].clone()
+    os.makedirs('pai', exist_ok=True)
+    if GPA.pc.get_using_safe_tensors():
+        UPA._save_file_deduped(state, 'pai/best_model.pt')
+    else:
+        raise NotImplementedError('PAI is set to pickle whole models; write_best_model needs safetensors')
+    string = ''.join(map(chr, source['tracker_string'].tolist()))
+    print(f"=> wrote pai/best_model.pt from '{resume_best_model_path(args.pai_resume)}': {copied} "
+          f"weights, best epoch {tracker_value(string, 'num_epochs_run')} "
+          f"(score {float(tracker_value(string, 'current_best_validation_score')):.3f})")
 
 
 def restore_training(optimizer, scheduler, scaler, checkpoint, args):
