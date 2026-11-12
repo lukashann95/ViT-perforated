@@ -624,6 +624,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
         data_time.update(time.time() - end)
+        if args.pai:
+            pai_setup.DIAG['step'] = step
         if args.pai and step <= args.pai_warmup:
             pai_setup.warmup_lr(optimizer, args, step)
         step_loss = 0.0
@@ -666,6 +668,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             scaler.step(optimizer)
             scaler.update()
             optimizer_updated = scaler.get_scale() >= previous_scale
+            if args.pai:
+                pai_setup.DIAG['scale'] = previous_scale
+                if not optimizer_updated:
+                    # fp16 overflow in this backward: GradScaler skipped the step and backed off.
+                    pai_setup.DIAG['last_scale_drop_step'] = step
         optimizer.zero_grad()
         if best_model_pending:
             pai_setup.write_best_model(original_model, args)

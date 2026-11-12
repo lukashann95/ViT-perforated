@@ -21,9 +21,63 @@ import torch.nn as nn
 
 GPA = UPA = None
 
+# Context for diagnose(): main.py records the step and GradScaler events, and forward pre-hooks
+# keep a reference (no copy) to the last input of every module that can grow dendrites.
+DIAG = {'inputs': {}, 'hooks': []}
+
+
+def _finite_summary(tensor):
+    t = tensor.detach()
+    bad = (~torch.isfinite(t)).sum().item() if t.is_floating_point() else 0
+    absmax = t.float().abs().max().item() if t.numel() else 0.0
+    return f"shape {tuple(t.shape)} {str(t.dtype).replace('torch.', '')} non-finite {bad} absmax {absmax:.4g}"
+
+
+def diagnose(dump_path='pai_diagnostics.pt'):
+    """Print the state of the dendrite modules and save it to dump_path (in the log directory)."""
+    try:
+        print("=== PAI diagnostics ===")
+        for key in ('step', 'scale', 'last_scale_drop_step'):
+            print(f"  {key}: {DIAG.get(key)}")
+        tracker = GPA.pai_tracker.member_vars
+        print(f"  tracker: mode {tracker.get('mode')}, epoch {tracker.get('num_epochs_run')}, "
+              f"dendrites added {tracker.get('num_dendrites_added')}")
+        dump = {'context': {k: v for k, v in DIAG.items() if k not in ('inputs', 'hooks')}, 'modules': {}}
+        for module in GPA.pai_tracker.neuron_module_vector:
+            name = getattr(module, 'name', type(module).__name__)
+            x = DIAG['inputs'].get(id(module))
+            print(f"  module {name}")
+            print(f"    last input: {_finite_summary(x) if x is not None else 'none recorded'}")
+            for pname, p in module.named_parameters():
+                if not torch.isfinite(p).all() or 'candidate' in pname:
+                    print(f"    param {pname}: {_finite_summary(p)}")
+            for bname, b in module.named_buffers():
+                if b.is_floating_point() and not torch.isfinite(b).all():
+                    print(f"    buffer {bname}: {_finite_summary(b)}")
+            dump['modules'][name] = {
+                'input': x.detach().cpu() if x is not None else None,
+                'state': {k: v.detach().cpu() for k, v in module.state_dict().items()},
+            }
+        torch.save(dump, dump_path)
+        print(f"  saved {os.path.abspath(dump_path)}")
+    except Exception as exc:  # diagnostics must not hide the original error
+        print(f"  diagnostics failed: {exc!r}")
+
+
+def register_diagnostics(model):
+    """Keep a reference to the last input of each dendrite module. Call again after PAI
+    restructures the model, since it may rebuild modules."""
+    for handle in DIAG['hooks']:
+        handle.remove()
+    DIAG['hooks'], DIAG['inputs'] = [], {}
+    for module in GPA.pai_tracker.neuron_module_vector:
+        DIAG['hooks'].append(module.register_forward_pre_hook(
+            lambda m, inputs: DIAG['inputs'].__setitem__(id(m), inputs[0])))
+
 
 def _no_pdb(*args, **kwargs):
-    # PAI calls pdb.set_trace() on some errors. Batch jobs have no stdin, so fail loudly instead.
+    # PAI calls pdb.set_trace() on some errors. Batch jobs have no stdin, so report and fail loudly.
+    diagnose()
     raise RuntimeError("PerforatedAI called pdb.set_trace(); see traceback")
 
 
@@ -323,7 +377,9 @@ def perforate(model, args):
     pc.set_unwrapped_modules_confirmed(True)
     pc.set_configuration_confirmed(True)  # targets are set above; skip PAI's interactive picker
 
-    return UPA.perforate_model(model, doing_pai=not args.pai_control, save_name='pai', maximizing_score=True)
+    model = UPA.perforate_model(model, doing_pai=not args.pai_control, save_name='pai', maximizing_score=True)
+    register_diagnostics(model)
+    return model
 
 
 def setup_optimizer(model, args):
@@ -343,6 +399,8 @@ def add_score(model, acc1, args, device, force_switch=False):
     # Actual return order is (net, restructured, training_complete); the docstring lists it differently.
     model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
         100 * acc1, model, force_switch=force_switch)
+    if restructured:
+        register_diagnostics(model)
     return model.to(device), bool(restructured), training_complete
 
 
