@@ -64,15 +64,44 @@ def diagnose(dump_path='pai_diagnostics.pt'):
         print(f"  diagnostics failed: {exc!r}")
 
 
+# Per backward pass in dendrite phases: is the gradient at a dendrite module's output non-finite?
+_OVERFLOW_FLAGS = []
+
+
+def _check_output_grad(grad):
+    _OVERFLOW_FLAGS.append(~torch.isfinite(grad).all())
+
+
+def _watch_output_grad(module, inputs, output):
+    # The gradient at the module output is the error signal PAI trains dendrites on.
+    if torch.is_grad_enabled() and in_dendrite_phase():
+        out = output[0] if isinstance(output, (tuple, list)) else output
+        if torch.is_tensor(out) and out.requires_grad:
+            out.register_hook(_check_output_grad)
+
+
+def dendrite_grads_overflowed():
+    """True if a backward pass since the last call left a non-finite gradient at the output
+    of a dendrite module, i.e. fp16 overflowed under the loss scale. Clears the record."""
+    if not _OVERFLOW_FLAGS:
+        return False
+    found = bool(torch.stack(_OVERFLOW_FLAGS).any())
+    _OVERFLOW_FLAGS.clear()
+    return found
+
+
 def register_diagnostics(model):
-    """Keep a reference to the last input of each dendrite module. Call again after PAI
-    restructures the model, since it may rebuild modules."""
+    """Keep a reference to the last input of each dendrite module and watch the gradient at
+    its output in dendrite phases. Call again after PAI restructures the model, since it may
+    rebuild modules."""
     for handle in DIAG['hooks']:
         handle.remove()
     DIAG['hooks'], DIAG['inputs'] = [], {}
+    _OVERFLOW_FLAGS.clear()
     for module in GPA.pai_tracker.neuron_module_vector:
         DIAG['hooks'].append(module.register_forward_pre_hook(
             lambda m, inputs: DIAG['inputs'].__setitem__(id(m), inputs[0])))
+        DIAG['hooks'].append(module.register_forward_hook(_watch_output_grad))
 
 
 def _no_pdb(*args, **kwargs):

@@ -657,9 +657,19 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
             # during backward, so GradScaler has nothing to unscale, clip or inf-check. The
             # gradients carry the constant loss scale, which AdamW's update is invariant to.
+            # Do GradScaler's overflow handling here instead: an fp16 overflow under the loss
+            # scale would otherwise turn the candidate dendrite weights into NaN.
             l2_grads = torch.zeros((), device=device)
-            optimizer.step()
-            optimizer_updated = True
+            if pai_setup.dendrite_grads_overflowed():
+                previous_scale = scaler.get_scale()
+                scaler.update(previous_scale * scaler.get_backoff_factor())
+                optimizer_updated = False
+                pai_setup.DIAG['last_scale_drop_step'] = step
+                print(f"=> fp16 overflow in dendrite step {step}: skipped the update, "
+                      f"loss scale {previous_scale:g} -> {scaler.get_scale():g}")
+            else:
+                optimizer.step()
+                optimizer_updated = True
         else:
             # Unscale only after all microbatches have accumulated, before clipping.
             scaler.unscale_(optimizer)
