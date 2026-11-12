@@ -22,6 +22,11 @@ fi
 
 EPOCHS=${EPOCHS:-150}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
+# Optional: WD (main.py --wd), FIXED_SWITCH (switch to dendrites after N epochs, PAI fixed mode),
+# TAG (appended to the run name to tell experiments apart).
+EXTRA=()
+if [ -n "${WD:-}" ]; then EXTRA+=(--wd "$WD"); fi
+if [ -n "${FIXED_SWITCH:-}" ]; then EXTRA+=(--pai-fixed-switch "$FIXED_SWITCH"); fi
 PAI_TARGET=${PAI_TARGET:-mlp}
 TARGET_TAG=""
 if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
@@ -29,7 +34,7 @@ if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGENET=${IMAGENET:-$HOME/data/imagenet}
 LOG_ROOT=${LOG_ROOT:-$HOME/runs}
-RUN_NAME="vit_tiny_pai_scratch_${ARM}${TARGET_TAG}_20pct_$(date +%Y%m%d_%H%M)"
+RUN_NAME="vit_tiny_pai_scratch_${ARM}${TARGET_TAG}${TAG:+_$TAG}_20pct_$(date +%Y%m%d_%H%M)"
 
 # PerforatedAI credentials (PAIEMAIL/PAITOKEN).
 if [ -f "$HOME/.pai_env" ]; then source "$HOME/.pai_env"; fi
@@ -75,6 +80,7 @@ cd "$REPO"
     "${PAI_ARGS[@]}" \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
+    ${EXTRA[@]+"${EXTRA[@]}"} \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
     --report-to wandb

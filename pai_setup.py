@@ -165,6 +165,10 @@ def add_arguments(parser):
                             'PAI owns the scheduler, so --warmup does not apply to PAI runs.')
     group.add_argument('--max-dendrites', default=1, type=int,
                        help='maximum dendrite rounds PAI may add')
+    group.add_argument('--pai-fixed-switch', default=None, type=int, metavar='N',
+                       help='switch on a fixed schedule (PAI DOING_FIXED_SWITCH) instead of when '
+                            'validation stops improving: dendrite phases start after N epochs of '
+                            'neuron training and last --pai-p-epochs-to-switch epochs')
     group.add_argument('--pai-n-epochs-to-switch', default=10, type=int,
                        help='minimum validations in a neuron phase before PAI may switch')
     group.add_argument('--pai-p-epochs-to-switch', default=2, type=int,
@@ -186,6 +190,8 @@ def check_args(parser, args):
         parser.error('--pai-layers needs at least one layer index')
     if args.pai_warmup < 0:
         parser.error('--pai-warmup must be non-negative')
+    if args.pai_fixed_switch is not None and args.pai_fixed_switch < 1:
+        parser.error('--pai-fixed-switch must be at least 1')
     if args.pai_resume and args.pai_init:
         parser.error('--pai-resume and --pai-init are mutually exclusive')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
@@ -391,6 +397,11 @@ def perforate(model, args):
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
     pc.set_p_epochs_to_switch(args.pai_p_epochs_to_switch)
+    if getattr(args, 'pai_fixed_switch', None):
+        pc.set_switch_mode(pc.DOING_FIXED_SWITCH)
+        pc.set_n_fixed_switch_num(args.pai_fixed_switch)
+        pc.set_first_fixed_switch_num(args.pai_fixed_switch)
+        pc.set_p_fixed_switch_num(args.pai_p_epochs_to_switch)
     if args.pai_initial_correlation_batches is not None:
         pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
     if args.pai_candidate_grad_clipping is not None:
