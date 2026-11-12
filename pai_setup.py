@@ -213,7 +213,7 @@ def restore_tracker(model, checkpoint, args):
 def resume_best_model_path(resume_path):
     """PAI's best_model.pt saved with a --pai-resume checkpoint: <snapshot>/pai/ for archived
     snapshots, <run>/pai/ for <run>/checkpoints/."""
-    folder = os.path.dirname(resume_path)
+    folder = os.path.dirname(os.path.realpath(resume_path))
     for candidate in (os.path.join(folder, 'pai', 'best_model.pt'),
                       os.path.join(os.path.dirname(folder), 'pai', 'best_model.pt')):
         if os.path.isfile(candidate):
