@@ -41,6 +41,9 @@ fi
 
 EPOCHS=${EPOCHS:-300}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
+# CAND_CLIP: clip candidate dendrite gradients to this norm (PAI's suggestion for NaN candidates).
+EXTRA=()
+if [ -n "${CAND_CLIP:-}" ]; then EXTRA+=(--pai-candidate-grad-clipping "$CAND_CLIP"); fi
 PAI_TARGET=${PAI_TARGET:-mlp}
 TARGET_TAG=""
 if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
@@ -91,6 +94,7 @@ cd "$REPO"
     "${PAI_ARGS[@]}" \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
+    ${EXTRA[@]+"${EXTRA[@]}"} \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
     --report-to wandb
