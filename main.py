@@ -140,6 +140,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--fake-data', action='store_true', help="use fake data to benchmark")
 parser.add_argument('--amp', action='store_true',
                     help='Use CUDA FP16 automatic mixed precision (default: FP32)')
+parser.add_argument('--tf32', action='store_true',
+                    help='allow TF32 tensor cores for FP32 matmuls and convolutions (Ampere and newer)')
 parser.add_argument('--max-steps', type=int, default=None,
                     help='Limit training batches in this invocation without shortening the LR schedule')
 parser.add_argument("--logs", default="./logs/", type=str,
@@ -204,6 +206,10 @@ def main():
         parser.error('--train-fraction must be in (0, 1]')
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error('--max-steps must be positive')
+    if args.tf32:
+        # PyTorch keeps TF32 off for matmuls by default; 'high' allows it (FP32 range, ~10-bit mantissa).
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.allow_tf32 = True
     if args.amp and not torch.cuda.is_available():
         parser.error('--amp requires a CUDA GPU')
 

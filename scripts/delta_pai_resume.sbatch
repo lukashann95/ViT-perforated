@@ -1,0 +1,103 @@
+#!/bin/bash
+#SBATCH --job-name=vit-pai-resume
+#SBATCH --account=bjto-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --output=/projects/bjto/lhann/runs/slurm-%j.out
+
+# Continue a from-scratch PAI run's neuron phase from a pre-switch checkpoint (--pai-resume) on
+# one Delta GPU, with dendrites on encoder layer ARM. Default: the shared step-61000 snapshot of
+# vit_tiny_pai_scratch_11_20pct_20261111_0433, the starting point of the AWS resume-* runs.
+#   sbatch scripts/delta_pai_resume.sbatch                      # layer 11, ln_mlp, FP32 + TF32
+#   sbatch --export=ALL,ARM=7 scripts/delta_pai_resume.sbatch   # another layer
+#   sbatch --export=ALL,ARM=control scripts/delta_pai_resume.sbatch
+# Precision: FP32 with TF32 tensor cores by default (no fp16 AMP); AMP=1 restores --amp.
+# EPOCHS is the total including the shared epochs and only a safety cap; PAI ends the run.
+
+set -euo pipefail
+umask 002
+
+ARM=${ARM:-11}
+PAI_TARGET=${PAI_TARGET:-ln_mlp}
+EPOCHS=${EPOCHS:-300}
+MAX_DENDRITES=${MAX_DENDRITES:-2}
+PROJECT=/projects/bjto/lhann
+SHARED=/projects/bjto/shared
+REPO=$PROJECT/ViT-perforated
+PARQUET=$SHARED/imagenet_1k_resized_256/data
+RESUME=${RESUME:-$SHARED/checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000/checkpoint.pth.tar}
+LOG_ROOT=$PROJECT/runs
+LOCAL=${LOCAL:-/tmp/$USER/imagenet_$SLURM_JOB_ID}
+# The source run's W&B id is its log directory name (<run>/archive/<snapshot>/ or <run>/checkpoints/).
+SRC_DIR=${RESUME%%/archive/*}
+[ "$SRC_DIR" = "$RESUME" ] && SRC_DIR=${RESUME%%/checkpoints/*}
+SRC_RUN=$(basename "$SRC_DIR")
+
+if [ "$ARM" = control ]; then
+    PAI_ARGS=(--pai-layers 11 --pai-control)
+else
+    PAI_ARGS=(--pai-layers "$ARM")
+fi
+PRECISION=(--tf32)
+PREC_TAG=fp32
+if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
+RUN_NAME="vit_tiny_pai_resume_${ARM}_${PAI_TARGET}_${PREC_TAG}_20pct_$(date +%Y%m%d_%H%M)"
+
+source "$PROJECT/.pai_env"
+: "${PAIEMAIL:?PAIEMAIL is not set in $PROJECT/.pai_env}"
+: "${PAITOKEN:?PAITOKEN is not set in $PROJECT/.pai_env}"
+test -r "$RESUME"
+test -r "$(dirname "$RESUME")/pai/best_model.pt"   # PAI reloads it at the first switch
+mkdir -p "$LOG_ROOT"
+
+# Unpack the parquet shards to node-local disk: 1.3M small files would be slow on /projects.
+mkdir -p "$LOCAL"
+avail_gb=$(df -BG --output=avail "$LOCAL" | tail -1 | tr -dc 0-9)
+if [ "$avail_gb" -lt 40 ]; then
+    echo "only ${avail_gb} GB free on $(df --output=target "$LOCAL" | tail -1); need ~30 GB" >&2
+    exit 1
+fi
+trap 'rm -rf "$LOCAL"' EXIT
+echo "Unpacking ImageNet to $LOCAL ($avail_gb GB free)..."
+start=$SECONDS
+# pyarrow lives in a small separate venv ($PROJECT/.venv-data) so the training lockfile stays unchanged.
+"$PROJECT/.venv-data/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" "$PARQUET" "$LOCAL" --workers "$SLURM_CPUS_PER_TASK"
+echo "Unpacked in $((SECONDS - start)) s"
+
+export WANDB_DIR="$LOG_ROOT/$RUN_NAME"
+export WANDB_ENTITY="IdlF26Group40"
+export WANDB_PROJECT="ViT-perforated"
+mkdir -p "$WANDB_DIR"
+export OMP_NUM_THREADS=1
+
+cd "$REPO"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+.venv/bin/python -u main.py "$LOCAL" \
+    --gpu 0 \
+    --train-fraction 0.2 \
+    --subset-seed 42 \
+    --hidden-dim 192 \
+    --num-layers 12 \
+    --num-heads 3 \
+    --patch-size 16 \
+    --batch-size 512 \
+    --accum-freq 1 \
+    "${PRECISION[@]}" \
+    --mlp-head \
+    --torchvision-inception-crop \
+    --epochs "$EPOCHS" \
+    --lr 5e-4 \
+    --log-steps 500 \
+    --workers $((SLURM_CPUS_PER_TASK - 2)) \
+    --pai-resume "$RESUME" \
+    --wandb-history-from "$SRC_RUN" \
+    "${PAI_ARGS[@]}" \
+    --pai-target "$PAI_TARGET" \
+    --max-dendrites "$MAX_DENDRITES" \
+    --logs "$LOG_ROOT" \
+    --name "$RUN_NAME" \
+    --report-to wandb
