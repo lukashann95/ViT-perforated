@@ -16,6 +16,8 @@
 #   sbatch --export=ALL,ARM=7 scripts/delta_pai_resume.sbatch   # another layer
 #   sbatch --export=ALL,ARM=control scripts/delta_pai_resume.sbatch
 # Precision: FP32 with TF32 tensor cores by default (no fp16 AMP); AMP=1 restores --amp.
+# PAI_MODE: pb (default, Perforated Backpropagation / cascade correlation) or gd (dendrites trained
+# by gradient descent with the neurons, PAI's open-source mode).
 # EPOCHS is the total including the shared epochs and only a safety cap; PAI ends the run.
 
 set -euo pipefail
@@ -42,10 +44,17 @@ if [ "$ARM" = control ]; then
 else
     PAI_ARGS=(--pai-layers "$ARM")
 fi
+PAI_MODE=${PAI_MODE:-pb}
+MODE_ARGS=()
+case "$PAI_MODE" in
+    pb) ;;
+    gd) MODE_ARGS=(--pai-gd) ;;
+    *) echo "PAI_MODE must be pb or gd" >&2; exit 1 ;;
+esac
 PRECISION=(--tf32)
 PREC_TAG=fp32
 if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
-RUN_NAME="vit_tiny_pai_resume_${ARM}_${PAI_TARGET}_${PREC_TAG}_20pct_$(date +%Y%m%d_%H%M)"
+RUN_NAME="vit_tiny_pai_resume_${ARM}_${PAI_TARGET}_${PAI_MODE}_${PREC_TAG}_20pct_$(date +%Y%m%d_%H%M)"
 
 source "$PROJECT/.pai_env"
 : "${PAIEMAIL:?PAIEMAIL is not set in $PROJECT/.pai_env}"
@@ -96,6 +105,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --pai-resume "$RESUME" \
     --wandb-history-from "$SRC_RUN" \
     "${PAI_ARGS[@]}" \
+    ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
     --logs "$LOG_ROOT" \

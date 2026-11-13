@@ -151,6 +151,10 @@ def add_arguments(parser):
     group.add_argument('--pai-target', default='ln_mlp', choices=sorted(TARGETS),
                        help='perforate the MLP with its pre-norm ln_2 (default; PAI wants norm '
                             'layers inside blocks), the whole MLP block, or only its first/second Linear')
+    group.add_argument('--pai-gd', action='store_true',
+                       help="train dendrites by gradient descent together with the neurons (PAI's "
+                            "open-source mode) instead of Perforated Backpropagation's cascade-"
+                            "correlation phases, even when perforatedbp is installed")
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
@@ -415,6 +419,11 @@ def perforate(model, args):
             mlp[index] = GPA.PAISequential([mlp[index]])
 
     pc = GPA.pc
+    if getattr(args, 'pai_gd', False):
+        # Importing perforatedbp switches PAI to Perforated Backpropagation; restore the
+        # open-source defaults so dendrites are trained by gradient descent with the neurons.
+        pc.set_perforated_backpropagation(False)
+        pc.set_no_extra_n_modes(True)
     pc.set_testing_dendrite_capacity(False)
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
