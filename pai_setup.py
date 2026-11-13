@@ -147,9 +147,9 @@ def add_arguments(parser):
     group.add_argument('--pai-layers', nargs='*', type=int, default=None, metavar='I',
                        help='0-indexed encoder layers whose MLP gets dendrites, e.g. 3 7 11. '
                             'Enables PAI; fine-tunes --pai-init if given, else trains from scratch.')
-    group.add_argument('--pai-target', default='mlp', choices=sorted(TARGETS),
-                       help='perforate the whole MLP block, the MLP with its pre-norm ln_2, '
-                            'or only its first/second Linear')
+    group.add_argument('--pai-target', default='ln_mlp', choices=sorted(TARGETS),
+                       help='perforate the MLP with its pre-norm ln_2 (default; PAI wants norm '
+                            'layers inside blocks), the whole MLP block, or only its first/second Linear')
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
@@ -293,6 +293,8 @@ def restore_tracker(model, checkpoint, args):
     tracker.from_string(tracker_string(checkpoint))
     # Run identity comes from this run's flags, not the source run (e.g. a control arm).
     tracker.member_vars['doing_pai'] = not args.pai_control
+    if getattr(args, 'pai_fixed_switch', None):
+        tracker.member_vars['switch_mode'] = GPA.pc.DOING_FIXED_SWITCH
     tracker.saved_time = time.time()
     tracker.loaded = True
     # PAI saves before the next epoch starts; load_system calls this to fix the off-by-one.
@@ -347,13 +349,22 @@ def write_best_model(model, args):
             raise ValueError(f"source best model has no weight for '{key}' ('{name}')")
         state[key] = best[name].clone()
         copied += 1
-    state['tracker_string'] = source['tracker_string'].clone()
+    # PAI also reloads the tracker stored in best_model.pt at a switch; give it this run's identity.
+    string = ''.join(map(chr, source['tracker_string'].tolist()))
+    run_settings = {'doing_pai': str(not args.pai_control)}
+    if getattr(args, 'pai_fixed_switch', None):
+        run_settings['switch_mode'] = str(GPA.pc.DOING_FIXED_SWITCH)
+    lines = string.split('\n')
+    for i, line in enumerate(lines):
+        name = line.split(',', 1)[0]
+        if name in run_settings and ',' in line:
+            lines[i] = f"{name},{run_settings[name]}"
+    state['tracker_string'] = torch.tensor([ord(c) for c in '\n'.join(lines)], dtype=torch.uint8)
     os.makedirs('pai', exist_ok=True)
     if GPA.pc.get_using_safe_tensors():
         UPA._save_file_deduped(state, 'pai/best_model.pt')
     else:
         raise NotImplementedError('PAI is set to pickle whole models; write_best_model needs safetensors')
-    string = ''.join(map(chr, source['tracker_string'].tolist()))
     print(f"=> wrote pai/best_model.pt from '{resume_best_model_path(args.pai_resume)}': {copied} "
           f"weights, best epoch {tracker_value(string, 'num_epochs_run')} "
           f"(score {float(tracker_value(string, 'current_best_validation_score')):.3f})")

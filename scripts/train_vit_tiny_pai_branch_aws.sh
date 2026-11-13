@@ -46,9 +46,9 @@ EXTRA=()
 if [ -n "${CAND_CLIP:-}" ]; then EXTRA+=(--pai-candidate-grad-clipping "$CAND_CLIP"); fi
 # WD: weight decay (main.py's --wd, divided by the LR). PAI notes weight decay can hurt dendrite learning.
 if [ -n "${WD:-}" ]; then EXTRA+=(--wd "$WD"); fi
-PAI_TARGET=${PAI_TARGET:-mlp}
-TARGET_TAG=""
-if [ "$PAI_TARGET" != mlp ]; then TARGET_TAG="_${PAI_TARGET}"; fi
+PAI_TARGET=${PAI_TARGET:-ln_mlp}
+# Always name the target: older runs without a target tag used 'mlp'.
+TARGET_TAG="_${PAI_TARGET}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGENET=${IMAGENET:-$HOME/data/imagenet}
