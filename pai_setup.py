@@ -138,8 +138,9 @@ def _dendrites_in_fp32():
     cls.forward = fp32_forward
 
 # Submodule of torchvision's MLPBlock to perforate: Linear(D, 4D), GELU, Dropout, Linear(4D, D), Dropout.
-# 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP.
-TARGETS = {'mlp': None, 'ln_mlp': None, 'fc1': 0, 'fc2': 3}
+# 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP; 'ln_fc1' wraps ln_2 with the
+# first Linear only (dendrites on the 4D hidden units before the GELU).
+TARGETS = {'mlp': None, 'ln_mlp': None, 'ln_fc1': 0, 'fc1': 0, 'fc2': 3}
 
 
 def add_arguments(parser):
@@ -222,6 +223,10 @@ def plain_key(key, target):
         # PAISequential([ln_2, mlp]) replaced mlp, and ln_2 became Identity.
         key = re.sub(r'\.mlp\.model\.0\.', '.ln_2.', key)
         key = re.sub(r'\.mlp\.model\.1\.', '.mlp.', key)
+    elif target == 'ln_fc1':
+        # PAISequential([ln_2, fc1]) replaced mlp[0], and ln_2 became Identity.
+        key = re.sub(r'\.mlp\.0\.model\.0\.', '.ln_2.', key)
+        key = re.sub(r'\.mlp\.0\.model\.1\.', '.mlp.0.', key)
     else:  # fc1 / fc2: mlp[i] = PAISequential([Linear])
         key = re.sub(r'\.mlp\.(\d+)\.model\.0\.', r'.mlp.\1.', key)
     return key
@@ -230,6 +235,8 @@ def plain_key(key, target):
 def detect_target(state_dict):
     """The --pai-target a perforated state_dict was saved with."""
     keys = [k.replace('.main_module.', '.') for k in state_dict]
+    if any('.mlp.0.model.1.' in k for k in keys):
+        return 'ln_fc1'
     if any('.mlp.model.1.' in k for k in keys):
         return 'ln_mlp'
     if any('.mlp.model.0.' in k for k in keys):
@@ -397,6 +404,10 @@ def perforate(model, args):
         if args.pai_target == 'ln_mlp':
             # forward() computes mlp(ln_2(x)), so moving ln_2 inside the wrapper keeps the math.
             block.mlp = GPA.PAISequential([block.ln_2, mlp])
+            block.ln_2 = nn.Identity()
+        elif args.pai_target == 'ln_fc1':
+            # Likewise: mlp[0](ln_2(x)) with ln_2 moved into the wrapper around the first Linear.
+            mlp[0] = GPA.PAISequential([block.ln_2, mlp[0]])
             block.ln_2 = nn.Identity()
         elif index is None:
             block.mlp = GPA.PAISequential([mlp])
