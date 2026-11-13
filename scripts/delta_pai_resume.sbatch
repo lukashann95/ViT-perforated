@@ -18,6 +18,8 @@
 # Precision: FP32 with TF32 tensor cores by default (no fp16 AMP); AMP=1 restores --amp.
 # PAI_MODE: pb (default, Perforated Backpropagation / cascade correlation) or gd (dendrites trained
 # by gradient descent with the neurons, PAI's open-source mode).
+# DENDRITE_LOSS=covariance (pb only): perforatedbp's CovarianceDendriteLoss instead of 4.0.0's
+# default, whose PB scores are always 0; adds _covloss to the run name.
 # EPOCHS is the total including the shared epochs and only a safety cap; PAI ends the run.
 
 set -euo pipefail
@@ -51,10 +53,16 @@ case "$PAI_MODE" in
     gd) MODE_ARGS=(--pai-gd) ;;
     *) echo "PAI_MODE must be pb or gd" >&2; exit 1 ;;
 esac
+LOSS_TAG=
+case "${DENDRITE_LOSS:-default}" in
+    default) ;;
+    covariance) MODE_ARGS+=(--pai-dendrite-loss covariance); LOSS_TAG=_covloss ;;
+    *) echo "DENDRITE_LOSS must be default or covariance" >&2; exit 1 ;;
+esac
 PRECISION=(--tf32)
 PREC_TAG=fp32
 if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
-RUN_NAME="vit_tiny_pai_resume_${ARM}_${PAI_TARGET}_${PAI_MODE}_${PREC_TAG}_20pct_$(date +%Y%m%d_%H%M)"
+RUN_NAME="vit_tiny_pai_resume_${ARM}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}_20pct_$(date +%Y%m%d_%H%M)"
 
 source "$PROJECT/.pai_env"
 : "${PAIEMAIL:?PAIEMAIL is not set in $PROJECT/.pai_env}"

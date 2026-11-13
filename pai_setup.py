@@ -155,6 +155,10 @@ def add_arguments(parser):
                        help="train dendrites by gradient descent together with the neurons (PAI's "
                             "open-source mode) instead of Perforated Backpropagation's cascade-"
                             "correlation phases, even when perforatedbp is installed")
+    group.add_argument('--pai-dendrite-loss', default='default', choices=['default', 'covariance'],
+                       help="Perforated Backpropagation candidate loss: perforatedbp's default "
+                            "(ImprovedCovarianceDendriteLoss in 4.0.0, whose scores are always 0) "
+                            "or the older CovarianceDendriteLoss")
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
@@ -193,6 +197,8 @@ def check_args(parser, args):
         return
     if not args.pai_layers:
         parser.error('--pai-layers needs at least one layer index')
+    if args.pai_dendrite_loss != 'default' and (args.pai_gd or args.pai_control):
+        parser.error('--pai-dendrite-loss applies only to Perforated Backpropagation runs')
     if args.pai_warmup < 0:
         parser.error('--pai-warmup must be non-negative')
     if args.pai_fixed_switch is not None and args.pai_fixed_switch < 1:
@@ -424,6 +430,12 @@ def perforate(model, args):
         # open-source defaults so dendrites are trained by gradient descent with the neurons.
         pc.set_perforated_backpropagation(False)
         pc.set_no_extra_n_modes(True)
+    if getattr(args, 'pai_dendrite_loss', 'default') == 'covariance':
+        import perforatedbp.tracker_pbp as TPB
+        import perforatedbp.dendrite_losses.dendrite_loss_pbp as DLP
+        TPB.setup_new_global_dendrite_mode(
+            DLP.CovarianceDendriteLoss, TPB.best_cascor_score_improved_this_epoch,
+            dendrite_learn_mode=True)
     pc.set_testing_dendrite_capacity(False)
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
