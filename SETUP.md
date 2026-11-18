@@ -29,27 +29,39 @@ If the machine has no access to the GitHub repo, copy the folder over instead (w
 
 ## 2. Credentials: the `.env` file
 
-The runs need a W&B API key and a PerforatedAI license. They live in `.env` in the repo root.
-**`.env` is in `.gitignore` and must never be committed**, so it does not come with `git clone`
-and has to be put on each machine separately. `.env.example` (committed) shows the format:
+The runs need a W&B API key and a PerforatedAI license. They go in a file named **`.env`** in
+the repo root (`ViT-perforated/.env`).
+
+- **`.env`** holds your real keys. It is in `.gitignore`, so it is never committed or pushed,
+  and it does **not** come with `git clone`: every machine needs its own copy.
+- **`.env.example`** is only the committed template. **Never put keys in it**: anything in it can
+  end up on GitHub. (`setup_machine.sh` warns if it finds keys there.)
+
+`.env` must look like this, one `KEY=value` per line, no quotes, no spaces around `=`:
 
 ```bash
-WANDB_API_TOKEN=          # from https://wandb.ai/authorize
+WANDB_API_TOKEN=<your W&B API key, from https://wandb.ai/authorize>
 WANDB_ENTITY=IdlF26Group40
 WANDB_PROJECT=ViT-perforated
-PAIEMAIL=                 # PerforatedAI license email
-PAITOKEN=                 # PerforatedAI license token
+PAIEMAIL=<PerforatedAI license email>
+PAITOKEN=<PerforatedAI license token>
 ```
 
-Either way works:
+Get it onto a machine in one of two ways:
 
-- **Copy your filled-in `.env` from your own computer** (it stays off GitHub; scp sends it over SSH):
+- **Create it on the machine:**
+  ```bash
+  cd ViT-perforated
+  cp .env.example .env && chmod 600 .env     # chmod: readable only by you
+  nano .env                                  # fill in WANDB_API_TOKEN, PAIEMAIL, PAITOKEN
+  ```
+  If you skip this, `setup_machine.sh` creates `.env` for you, stops at step 3, and lists the
+  keys still missing. Fill them in and re-run it; finished steps are skipped.
+- **Copy a filled-in `.env` from your own computer** (`scp` sends it over SSH, not via GitHub):
   ```bash
   scp .env <user>@<host>:<path>/ViT-perforated/.env
   ssh <user>@<host> chmod 600 <path>/ViT-perforated/.env
   ```
-- **Or create it on the machine:** run `./scripts/setup_machine.sh` once. It copies
-  `.env.example` to `.env` (readable only by you), stops, and asks you to fill in the keys.
 
 Share the keys only over private channels (not Slack channels, issues or commits). Anyone with the
 W&B key can log runs as you; revoke it at https://wandb.ai/authorize when you no longer need it.

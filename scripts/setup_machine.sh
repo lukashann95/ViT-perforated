@@ -12,7 +12,7 @@
 # Steps (each is skipped when already done, so re-running is safe):
 #   1. install uv
 #   2. create the venv from uv.lock, with a torch build that has kernels for this GPU
-#   3. credentials: create .env from .env.example and check it is filled in
+#   3. credentials: check that .env holds the W&B and PerforatedAI keys (creates it if missing)
 #   4. dataset: download evanarlian/imagenet_1k_resized_256 and unpack it to ImageFolder
 #   5. smoke test: GPU, credentials, 6-layer perforation, dataset, and a 30-step PAI run
 #
@@ -65,20 +65,37 @@ if [ -n "$CAP" ] && [ "${CAP%%.*}" -ge 10 ]; then
 fi
 
 step "3/5 credentials (.env)"
+# The keys live in .env (git-ignored, never committed). .env.example is only the committed template.
+KEYS=(WANDB_API_TOKEN PAIEMAIL PAITOKEN)
 if [ ! -f .env ]; then
     cp .env.example .env
     chmod 600 .env
-    echo "Created $REPO/.env. Fill in WANDB_API_TOKEN, PAIEMAIL and PAITOKEN, then re-run this script."
-    exit 1
+    echo "No .env yet: created $REPO/.env from .env.example"
 fi
 set -a; source .env; set +a
-for var in WANDB_API_TOKEN PAIEMAIL PAITOKEN; do
-    if [ -z "${!var:-}" ]; then
-        echo "$var is empty in $REPO/.env; fill it in and re-run." >&2
-        exit 1
-    fi
+MISSING=()
+for var in "${KEYS[@]}"; do
+    if [ -z "${!var:-}" ]; then MISSING+=("$var"); fi
 done
-echo ".env has WANDB_API_TOKEN, PAIEMAIL and PAITOKEN"
+if [ ${#MISSING[@]} -gt 0 ]; then
+    cat >&2 <<EOF
+
+Missing keys in $REPO/.env: ${MISSING[*]}
+Open that file (e.g. nano $REPO/.env) and fill in each line as KEY=value, with no quotes or
+spaces around '=':
+  WANDB_API_TOKEN=   your W&B API key, from https://wandb.ai/authorize
+  PAIEMAIL=          PerforatedAI license email
+  PAITOKEN=          PerforatedAI license token
+Or copy a filled-in .env from another machine: scp .env <user>@<this host>:$REPO/.env
+Then re-run this script; finished steps are skipped.
+Edit .env, not .env.example: .env.example is committed to git, so keys in it could be pushed.
+EOF
+    exit 1
+fi
+echo ".env has ${KEYS[*]}"
+if grep -qE '^(WANDB_API_TOKEN|PAIEMAIL|PAITOKEN)=.+' .env.example; then
+    echo "WARNING: .env.example contains keys. It is committed to git; clear the values there." >&2
+fi
 
 step "4/5 dataset at $IMAGENET"
 if [ -f "$IMAGENET/.unpacked" ]; then
@@ -95,7 +112,11 @@ else
         for pattern in ${DATA_INCLUDE:-data/train-* data/val-*}; do
             INCLUDE+=(--include "$pattern")
         done
-        uvx --from huggingface_hub hf download evanarlian/imagenet_1k_resized_256 \
+        # The dataset is public, so download without any Hugging Face login or mirror settings
+        # this machine may have: a stale or restricted token (HF_TOKEN, ~/.cache/huggingface/token)
+        # or an HF_ENDPOINT mirror makes the Hub answer "Dataset not found".
+        env -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HF_ENDPOINT HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+            uvx --from huggingface_hub hf download evanarlian/imagenet_1k_resized_256 \
             --repo-type dataset --local-dir "$PARQUET" "${INCLUDE[@]}"
         SHARDS="$PARQUET/data"
     fi
