@@ -2,7 +2,9 @@
 
 `scripts/setup_machine.sh` installs uv, builds the venvs (`.venv` for training, `.venv-data` with
 pyarrow for unpacking), checks your keys, downloads ImageNet-1k as parquet shards (~22 GB) and,
-if a GPU is visible, runs a smoke test. It starts no training run. Finished steps are skipped,
+if a GPU is visible, runs a smoke test: GPU, keys, perforation, one Perforated Backpropagation
+dendrite epoch whose candidate correlation scores must register (they stayed 0 with
+perforatedai 4.0.0), and a 30-step PAI run. It starts no training run. Finished steps are skipped,
 so you can re-run it at any time.
 
 **1. Keys.** Put them in `.env` in the repo root. This file is git-ignored, so each machine needs

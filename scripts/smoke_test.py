@@ -6,7 +6,12 @@
 2. Credentials: WANDB_API_TOKEN, PAIEMAIL and PAITOKEN are set; the W&B key is accepted.
 3. Perforation: ViT-Tiny is perforated exactly as main.py does it, and the report lists which
    encoder blocks got dendrites, so you can confirm the layer choice.
-4. Dataset (with --data): DIR/train and DIR/val exist with matching class folders, e.g. after a
+4. Candidate scores: one Perforated Backpropagation dendrite epoch on random data, after which
+   the candidates must have nonzero correlation scores that PAI counts as improvements. This is
+   what failed with perforatedai 4.0.0: its pai_improvement_threshold_raw of 1e-4 is far above
+   the raw covariance scores (~1e-12 here), so no candidate ever improved and the PB scores
+   stayed 0. pai_setup.py sets the threshold to 0; this check also fails if it is not 0.
+5. Dataset (with --data): DIR/train and DIR/val exist with matching class folders, e.g. after a
    job has unpacked the parquet shards to local disk.
 
 Expects the credentials in the environment (setup_machine.sh exports .env before calling this).
@@ -77,7 +82,9 @@ def check_perforation(layers, target):
     section(f'Perforation: --pai-layers {" ".join(map(str, layers))} --pai-target {target}')
     args = main.parser.parse_args([
         '--tf32', '--mlp-head', '--hidden-dim', '192', '--num-layers', '12', '--num-heads', '3',
-        '--pai-layers', *map(str, layers), '--pai-target', target])
+        '--pai-layers', *map(str, layers), '--pai-target', target,
+        '--pai-initial-correlation-batches', '2'])
+    args.pai = True
     model = SimpleVisionTransformer(image_size=224, patch_size=16, num_layers=12, num_heads=3,
                                     hidden_dim=192, mlp_dim=768, representation_size=192)
     # PAI writes ./pai (config dump); keep it out of the repo. Its license check happens here.
@@ -106,7 +113,69 @@ def check_perforation(layers, target):
     y = torch.randint(0, 1000, (8,), device='cuda')
     _, loss = model(x, 1.0, y, y)
     loss.backward()
+    model.zero_grad()
     print(f'perforated forward/backward ok (loss {loss.item():.3f})')
+    return model, args
+
+
+def check_candidate_scores(model, args):
+    """One PB dendrite epoch; the candidates' correlation scores must register as improvements."""
+    import torch
+    import pai_setup
+    from perforatedai import globals_perforatedai as GPA
+    section('Candidate dendrite scores (Perforated Backpropagation)')
+    threshold = GPA.pc.get_pai_improvement_threshold_raw()
+    print(f'pai_improvement_threshold_raw = {threshold}')
+    if threshold != 0:
+        fail(f'pai_improvement_threshold_raw is {threshold}, not 0: candidate scores are tiny '
+             '(~1e-12), so with this threshold none ever counts as improving')
+
+    g = torch.Generator(device='cuda').manual_seed(0)
+
+    def train(model, optimizer, steps):
+        # As main.py does in both phases with --tf32: plain backward, then optimizer.step().
+        model.train()
+        for _ in range(steps):
+            x = torch.randn(32, 3, 224, 224, device='cuda', generator=g)
+            y = torch.randint(0, 1000, (32,), device='cuda', generator=g)
+            optimizer.zero_grad()
+            _, loss = model(x, 1.0, y, y)
+            loss.backward()
+            optimizer.step()
+
+    # PAI writes ./pai (checkpoints, graphs) at each switch; keep it out of the repo.
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            optimizer, _ = pai_setup.setup_optimizer(model, args)
+            train(model, optimizer, 5)
+            model, _, _ = pai_setup.add_score(model, 0.1, args, 'cuda', force_switch=True)
+            if not pai_setup.in_dendrite_phase():
+                fail('PAI did not switch to a dendrite phase')
+            optimizer, _ = pai_setup.setup_optimizer(model, args)
+            train(model, optimizer, 10)
+            # Ends the dendrite epoch: PAI scores the candidates and records improvements.
+            model, _, _ = pai_setup.add_score(model, 0.1, args, 'cuda')
+        finally:
+            os.chdir(cwd)
+
+    for name, module in model.named_modules():
+        if type(module).__name__ != 'PAIDendriteModule':
+            continue
+        values = module.dendrite_values[0]
+        raw = values.best_score.detach().float()
+        pearson = values.best_pearson_correlation.detach().float()
+        improved = int(values.nodes_best_improved_this_epoch.sum().item())
+        print(f'{name.removesuffix(".dendrite_module")}: {improved}/{raw.numel()} nodes improved, '
+              f'max |raw score| {raw.abs().max().item():.3e}, '
+              f'max |Pearson correlation| {pearson.abs().max().item():.3e}')
+        if not (torch.isfinite(raw).all() and torch.isfinite(pearson).all()):
+            fail('non-finite candidate scores')
+        if improved == 0 or not pearson.any():
+            fail('no candidate correlation score registered as an improvement '
+                 '(the PB scores would stay 0, as with perforatedai 4.0.0)')
+    print('candidate scores are nonzero and count as improvements')
 
 
 def check_data(path):
@@ -135,7 +204,8 @@ def main_():
 
     check_gpu()
     check_credentials(args.offline)
-    check_perforation(args.layers, args.target)
+    model, pai_args = check_perforation(args.layers, args.target)
+    check_candidate_scores(model, pai_args)
     if args.data:
         check_data(args.data)
     print('\nSMOKE TEST PASSED')
