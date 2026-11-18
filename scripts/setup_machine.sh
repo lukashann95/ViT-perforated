@@ -9,16 +9,19 @@
 # skipped):
 #   srun --gpus=1 --cpus-per-task=8 --time=1:00:00 -p <partition> -A <account> --pty ./scripts/setup_machine.sh
 #
-# The dataset is only downloaded, as parquet shards; it is NOT unpacked here. Each training job
-# unpacks the shards to node-local disk itself (as scripts/delta_pai_resume.sbatch does), with:
+# By default the dataset is only downloaded, as parquet shards, and each training job unpacks
+# them to node-local disk itself (as scripts/delta_pai_resume.sbatch does), with:
 #   $DATA_VENV/bin/python scripts/parquet_to_imagefolder.py $PARQUET_DIR <local dir> --workers <n>
+# UNPACK=1 unpacks them once here instead, e.g. on a personal machine whose disk is already local.
 #
 # Steps (each is skipped when already done, so re-running is safe):
 #   1. install uv
 #   2. training venv from uv.lock (torch 2.6.0+cu124), and a small pyarrow venv for unpacking
 #   3. credentials: check that .env holds the W&B and PerforatedAI keys (creates it if missing)
-#   4. dataset: download evanarlian/imagenet_1k_resized_256 (train + val parquet, ~22 GB)
-#   5. smoke test (needs a GPU): GPU, credentials, perforation, and a 30-step PAI run
+#   4. dataset: download evanarlian/imagenet_1k_resized_256 (train + val parquet, ~22 GB);
+#      with UNPACK=1 also unpack it to ImageFolder (~25 GB more)
+#   5. smoke test (needs a GPU): GPU, credentials, perforation, a 30-step PAI run, and the
+#      unpacked dataset if there is one
 #
 # Settings (environment variables):
 #   VENV=path           training venv (default: <repo>/.venv)
@@ -27,7 +30,9 @@
 #                       $DATA_DIR/imagenet_1k_resized_256/data
 #   PARQUET_DIR=path    shards already on this machine (a folder with train-*/val-*.parquet, e.g.
 #                       Delta's shared copy): only checked, nothing is downloaded or modified
-#   DOWNLOAD_DATA=0     skip step 4
+#   UNPACK=1            also unpack the shards to $IMAGENET
+#   IMAGENET=path       where UNPACK=1 unpacks to (default: $DATA_DIR/imagenet)
+#   DOWNLOAD_DATA=0     skip the download (step 4)
 #   DATA_INCLUDE="..."  download only shards matching these patterns, e.g. for a quick test:
 #                       DATA_INCLUDE="data/train-00000-* data/val-*"
 #   SKIP_SMOKE=1        skip step 5
@@ -38,6 +43,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VENV=${VENV:-$REPO/.venv}
 DATA_VENV=${DATA_VENV:-$REPO/.venv-data}
 DATA_DIR=${DATA_DIR:-$HOME/data}
+IMAGENET=${IMAGENET:-$DATA_DIR/imagenet}
 PYTHON="$VENV/bin/python"
 
 step() { echo; echo "##### $* #####"; }
@@ -98,7 +104,7 @@ if grep -qE '^(WANDB_API_TOKEN|PAIEMAIL|PAITOKEN)=.+' .env.example; then
     echo "WARNING: .env.example contains keys. It is committed to git; clear the values there." >&2
 fi
 
-step "4/5 dataset (parquet shards, not unpacked)"
+step "4/5 dataset"
 if [ -n "${PARQUET_DIR:-}" ]; then
     SHARDS="$PARQUET_DIR"
     echo "using the shards already in $SHARDS"
@@ -129,6 +135,19 @@ if [ -n "$SHARDS" ]; then
         exit 1
     fi
 fi
+if [ "${UNPACK:-0}" = 1 ]; then
+    if [ -f "$IMAGENET/.unpacked" ]; then
+        echo "already unpacked in $IMAGENET"
+    elif [ -z "$SHARDS" ]; then
+        echo "UNPACK=1 needs the shards: drop DOWNLOAD_DATA=0 or set PARQUET_DIR" >&2
+        exit 1
+    else
+        # $IMAGENET/{train,val}/<wnid>/*.JPEG (~25 GB more), the layout main.py reads.
+        echo "unpacking to $IMAGENET"
+        "$DATA_VENV/bin/python" scripts/parquet_to_imagefolder.py "$SHARDS" "$IMAGENET" --workers "$(nproc)"
+        touch "$IMAGENET/.unpacked"   # marks a complete unpack, so re-runs skip it
+    fi
+fi
 
 step "5/5 smoke test"
 if [ "${SKIP_SMOKE:-0}" = 1 ]; then
@@ -138,7 +157,9 @@ elif [ -z "$CAP" ]; then
     echo "Optional: run it in a GPU job, e.g."
     echo "  srun --gpus=1 --cpus-per-task=8 --time=1:00:00 -p <partition> -A <account> --pty ./scripts/setup_machine.sh"
 else
-    "$PYTHON" scripts/smoke_test.py
+    DATA_ARGS=()
+    if [ -f "$IMAGENET/.unpacked" ]; then DATA_ARGS=(--data "$IMAGENET"); fi
+    "$PYTHON" scripts/smoke_test.py ${DATA_ARGS[@]+"${DATA_ARGS[@]}"}
 
     # Short end-to-end PAI run on fake data (dendrites on layer 11): thresholds of 1 make PAI
     # switch to a dendrite phase, add a dendrite and restructure within 30 steps. Nothing is
@@ -171,3 +192,4 @@ echo "Setup complete."
 echo "  training python:  $PYTHON"
 echo "  unpacking python: $DATA_VENV/bin/python"
 if [ -n "$SHARDS" ]; then echo "  parquet shards:   $SHARDS"; fi
+if [ -f "$IMAGENET/.unpacked" ]; then echo "  unpacked data:    $IMAGENET"; fi
