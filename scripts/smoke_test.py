@@ -43,8 +43,16 @@ def check_gpu():
     major, minor = torch.cuda.get_device_capability(0)
     arch = f'sm_{major}{minor}'
     print(f'{name}, {arch}, torch {torch.__version__} (CUDA {torch.version.cuda})')
-    if arch not in torch.cuda.get_arch_list():
-        fail(f'this torch build has no {arch} kernels (it has {torch.cuda.get_arch_list()}); '
+    # Kernels built for sm_XY also run on sm_XZ with Z >= Y (same major), so e.g. the RTX 4090 and
+    # L40S (sm_89) use the sm_86 kernels; PyTorch's wheels ship no separate sm_89 build.
+    # 'sm_86' -> (8, 6), 'sm_120' -> (12, 0)
+    built = [(int(a[3:-1]), int(a[-1]), a) for a in torch.cuda.get_arch_list()
+             if a.startswith('sm_') and a[3:].isdigit()]
+    compatible = [a for M, m, a in sorted(built) if M == major and m <= minor]
+    if compatible:
+        print(f'kernels: {compatible[-1]}' + ('' if compatible[-1] == arch else f' (compatible with {arch})'))
+    else:
+        fail(f'this torch build has no kernels for {arch} (it has {torch.cuda.get_arch_list()}); '
              're-run setup_machine.sh so it picks a matching torch build')
     # Training runs in FP32 with TF32 tensor cores (main.py --tf32), as the run script does.
     torch.backends.cuda.matmul.allow_tf32 = True
