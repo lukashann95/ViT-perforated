@@ -13,11 +13,14 @@ cp .env.example .env && chmod 600 .env   # then fill in WANDB_API_TOKEN, PAIEMAI
 
 **2. Run setup.**
 ```bash
-UNPACK=1 ./scripts/setup_machine.sh                    # RTX 3090 / 4090: download and unpack to ~/data
-DATA_DIR=/path/with/space ./scripts/setup_machine.sh   # L40S cluster: on the login node
+UNPACK=1 ./scripts/setup_machine.sh       # RTX 3090 / 4090: download and unpack
+./scripts/setup_machine.sh                # L40S cluster: on the login node
 PARQUET_DIR=/projects/bjto/shared/imagenet_1k_resized_256/data \
-    nice -n 19 ./scripts/setup_machine.sh              # Delta: on the login node, reuses the shared shards
+    nice -n 19 ./scripts/setup_machine.sh # Delta: on the login node, reuses the shared shards
 ```
+The data goes next to the repo, in its parent directory: the shards in
+`../imagenet_1k_resized_256/data`, and with `UNPACK=1` the images in `../imagenet`. Set
+`DATA_DIR=/other/path` to put both somewhere else.
 
 On a cluster, leave out `UNPACK=1`: each job should unpack the shards to node-local disk itself,
 as `scripts/delta_pai_resume.sbatch` does:

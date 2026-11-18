@@ -26,8 +26,8 @@
 # Settings (environment variables):
 #   VENV=path           training venv (default: <repo>/.venv)
 #   DATA_VENV=path      pyarrow venv used to unpack the shards (default: <repo>/.venv-data)
-#   DATA_DIR=path       download location (default: ~/data); shards end up in
-#                       $DATA_DIR/imagenet_1k_resized_256/data
+#   DATA_DIR=path       download location (default: the repo's parent directory); shards end
+#                       up in $DATA_DIR/imagenet_1k_resized_256/data
 #   PARQUET_DIR=path    shards already on this machine (a folder with train-*/val-*.parquet, e.g.
 #                       Delta's shared copy): only checked, nothing is downloaded or modified
 #   UNPACK=1            also unpack the shards to $IMAGENET
@@ -42,7 +42,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VENV=${VENV:-$REPO/.venv}
 DATA_VENV=${DATA_VENV:-$REPO/.venv-data}
-DATA_DIR=${DATA_DIR:-$HOME/data}
+DATA_DIR=${DATA_DIR:-$(dirname "$REPO")}
 IMAGENET=${IMAGENET:-$DATA_DIR/imagenet}
 PYTHON="$VENV/bin/python"
 
