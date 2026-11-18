@@ -157,7 +157,8 @@ def add_arguments(parser):
                             "correlation phases, even when perforatedbp is installed")
     group.add_argument('--pai-dendrite-loss', default='default', choices=['default', 'covariance'],
                        help="Perforated Backpropagation candidate loss: perforatedbp's default "
-                            "(ImprovedCovarianceDendriteLoss in 4.0.0, whose scores are always 0) "
+                            "(ImprovedCovarianceDendriteLoss; its scores were always 0 in 4.0.0, "
+                            "fixed with perforatedbp 4.0.1) "
                             "or the older CovarianceDendriteLoss")
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
@@ -473,6 +474,10 @@ def perforate(model, args):
         pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
     if args.pai_candidate_grad_clipping is not None:
         pc.set_candidate_grad_clipping(args.pai_candidate_grad_clipping)
+    # A candidate dendrite counts as improving when its correlation score rises by more than this
+    # raw amount. perforatedai >= 4.0.1 needs 0 (its default in 4.0.2); set it explicitly so a
+    # changed default cannot stall the dendrite phase with no candidates ever improving.
+    pc.set_pai_improvement_threshold_raw(0)
     # Dendrites only on the wrapped targets. Everything else is tracked as a whole module, so
     # PAI never wraps the Linear that nn.MultiheadAttention uses internally.
     pc.set_modules_to_perforate([GPA.PAISequential])

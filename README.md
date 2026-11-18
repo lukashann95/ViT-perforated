@@ -1,3 +1,5 @@
+> **Running the PerforatedAI experiments on a new machine (3090, L40/L40S, Delta):** see [SETUP.md](SETUP.md).
+
 The `main` branch of this repository aims to reproduce [Better plain ViT baselines for ImageNet-1k](https://arxiv.org/abs/2205.01580) in pytorch,
 in particular the 76.7% top-1 validation set accuracy of the Head: MLP → linear variant after 90 epochs. This variant is no inferior than the default,
 and personally [I have better experience with simpler prediction head](https://iclr-blogposts.github.io/2024/blog/alibi-mlm/). The changes I have made

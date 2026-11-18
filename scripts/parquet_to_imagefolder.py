@@ -50,7 +50,9 @@ def main():
     parser.add_argument("out")
     parser.add_argument("--workers", type=int, default=os.cpu_count())
     args = parser.parse_args()
-    files = sorted(glob.glob(os.path.join(args.src, "*.parquet")))
+    # The dataset also ships unlabeled test-*.parquet shards (label -1); skip them.
+    files = sorted(glob.glob(os.path.join(args.src, "train-*.parquet")) +
+                   glob.glob(os.path.join(args.src, "val-*.parquet")))
     if not files:
         sys.exit(f"no parquet files in {args.src}")
     counts, mapping = {"train": 0, "val": 0}, {}
