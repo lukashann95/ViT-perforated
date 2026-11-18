@@ -157,6 +157,18 @@ elif [ -z "$CAP" ]; then
     echo "Optional: run it in a GPU job, e.g."
     echo "  srun --gpus=1 --cpus-per-task=8 --time=1:00:00 -p <partition> -A <account> --pty ./scripts/setup_machine.sh"
 else
+    # PAI runs refuse to start when more than one GPU is visible (even with --gpu 0), so show the
+    # smoke test exactly one: the first of CUDA_VISIBLE_DEVICES if set (e.g. by Slurm), otherwise
+    # the GPU with the most free memory. PCI_BUS_ID makes CUDA number GPUs as nvidia-smi does.
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*}
+    else
+        CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+            | sort -t, -k2 -nr | head -1 | cut -d, -f1)
+    fi
+    export CUDA_VISIBLE_DEVICES
+    echo "smoke test on GPU $CUDA_VISIBLE_DEVICES ($(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=name,memory.free --format=csv,noheader) free)"
     DATA_ARGS=()
     if [ -f "$IMAGENET/.unpacked" ]; then DATA_ARGS=(--data "$IMAGENET"); fi
     "$PYTHON" scripts/smoke_test.py ${DATA_ARGS[@]+"${DATA_ARGS[@]}"}
