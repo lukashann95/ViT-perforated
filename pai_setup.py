@@ -13,6 +13,7 @@ import json
 import os
 import pdb
 import re
+import shutil
 import time
 
 import torch
@@ -434,6 +435,26 @@ def write_best_model(model, args):
           f"(score {float(tracker_value(string, 'current_best_validation_score')):.3f})")
 
 
+def archive_pre_switch(args):
+    """Keep the run's latest pre-switch state in <run>/archive/pre_switch/, for --pai-resume.
+
+    Call after each validation's checkpoint save. While PAI is still in its first neuron phase
+    (mode 'n', no dendrites), copy checkpoints/checkpoint.pth.tar and pai/best_model.pt (which
+    PAI reloads at a switch) into the archive; from the first switch on, leave it alone, so it
+    holds the last neuron-only state. Both files are replaced atomically.
+    """
+    member_vars = GPA.pai_tracker.member_vars
+    if member_vars.get('mode') != 'n' or member_vars.get('num_dendrites_added', 0):
+        return
+    dest = os.path.join(args.log_dir, 'archive', 'pre_switch')
+    os.makedirs(os.path.join(dest, 'pai'), exist_ok=True)
+    for src, dst in ((os.path.join(args.log_dir, 'pai', 'best_model.pt'), os.path.join(dest, 'pai', 'best_model.pt')),
+                     (os.path.join(args.checkpoint_path, 'checkpoint.pth.tar'), os.path.join(dest, 'checkpoint.pth.tar'))):
+        if os.path.isfile(src):
+            shutil.copyfile(src, dst + '.tmp')
+            os.replace(dst + '.tmp', dst)
+
+
 def restore_training(optimizer, scheduler, scaler, checkpoint, args):
     """Restore optimizer, LR scheduler and GradScaler state; set the resume step."""
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -518,12 +539,23 @@ def perforate(model, args):
     return model
 
 
+def decays(name, param):
+    """Whether a parameter gets weight decay: main.weight_decay_param's rule (weight matrices)."""
+    return param.ndim >= 2 and name.endswith('weight')
+
+
 def setup_optimizer(model, args):
     # PAI builds the optimizer itself so it can swap to dendrite-only parameters in dendrite
     # phases. PAI steps the scheduler from validation scores; main.py must not step it.
     GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
     GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
-    opt_args = {'params': model.parameters(), 'lr': args.lr, 'betas': (args.beta1, args.beta2),
+    # Weight decay on weight matrices only, as main.py's baseline optimizer does: biases,
+    # LayerNorm gains and the like get none. PAI keeps parameter groups (minus parameters that
+    # do not require grad in the current phase), so this holds in every phase, dendrites included.
+    named = list(model.named_parameters())
+    groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
+              {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
+    opt_args = {'params': groups, 'lr': args.lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': args.weight_decay}
     sched_args = {'mode': 'max', 'patience': args.pai_patience}
     return GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)

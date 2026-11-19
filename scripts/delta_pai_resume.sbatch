@@ -18,11 +18,19 @@
 #   sbatch --export=ALL,ARM=control scripts/delta_pai_resume.sbatch          # layer 11, no dendrites
 #   sbatch --export=ALL,ARM=6-11,CONTROL=1 scripts/delta_pai_resume.sbatch   # layers 6..11, no dendrites
 # Precision: FP32 with TF32 tensor cores by default (no fp16 AMP); AMP=1 restores --amp.
+# Batch 1024 in one pass (no gradient accumulation) at LR 1e-3, as the 20% from-scratch baseline
+# (which reaches 1024 with 4x256 accumulation); validation every 250 steps (one epoch).
 # PAI_MODE: pb (default, Perforated Backpropagation / cascade correlation) or gd (dendrites trained
 # by gradient descent with the neurons, PAI's open-source mode).
-# DENDRITE_LOSS=covariance (pb only): perforatedbp's CovarianceDendriteLoss instead of 4.0.0's
-# default, whose PB scores are always 0; adds _covloss to the run name.
+# DENDRITE_LOSS=covariance (pb only): perforatedbp's older CovarianceDendriteLoss instead of the
+# default ImprovedCovarianceDendriteLoss (which scores since pai_setup sets the improvement
+# threshold to 0); adds _covloss to the run name.
 # EPOCHS is the total including the shared epochs and only a safety cap; PAI ends the run.
+# SCRATCH=1: train from random initialization instead of branching from RESUME, with a linear LR
+# warmup over PAI_WARMUP steps (default 2000, the baseline's 8 epochs at batch 1024). The run is
+# named vit_tiny_pai_scratch_<ARM>_... and keeps its last pre-switch state in
+# <run>/archive/pre_switch/, which later arms can branch from with
+# RESUME=<run dir>/archive/pre_switch/checkpoint.pth.tar. Pass SCRATCH=1 with CONTINUE_RUN too.
 # CONTINUE_RUN=<run name>: continue that run after a timeout from its last checkpoint (main.py
 # --resume; dendrites allowed, but it must have been saved in a neuron phase), in the same log
 # directory. W&B gets a new run, <run name>_cont<job id>, with the original run's history up to
@@ -84,7 +92,10 @@ esac
 PRECISION=(--tf32)
 PREC_TAG=fp32
 if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
-RUN_PREFIX="vit_tiny_pai_resume_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}_20pct_"
+SCRATCH=${SCRATCH:-0}
+KIND=resume
+[ "$SCRATCH" = 1 ] && KIND=scratch
+RUN_PREFIX="vit_tiny_pai_${KIND}_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}_20pct_"
 if [ -n "${CONTINUE_RUN:-}" ]; then
     case "$CONTINUE_RUN" in
         "$RUN_PREFIX"*) ;;
@@ -104,14 +115,18 @@ if [ -n "${CONTINUE_RUN:-}" ]; then
     WANDB_DIR=$LOG_ROOT/$RUN_NAME/$WANDB_RUN
 else
     RUN_NAME="${RUN_PREFIX}$(date +%Y%m%d_%H%M)"
-    START_ARGS=(--pai-resume "$RESUME" --wandb-history-from "$SRC_RUN")
+    if [ "$SCRATCH" = 1 ]; then
+        START_ARGS=(--pai-warmup "${PAI_WARMUP:-2000}")
+    else
+        START_ARGS=(--pai-resume "$RESUME" --wandb-history-from "$SRC_RUN")
+    fi
     WANDB_DIR=$LOG_ROOT/$RUN_NAME
 fi
 
 source "$PROJECT/.pai_env"
 : "${PAIEMAIL:?PAIEMAIL is not set in $PROJECT/.pai_env}"
 : "${PAITOKEN:?PAITOKEN is not set in $PROJECT/.pai_env}"
-if [ -z "${CONTINUE_RUN:-}" ]; then
+if [ -z "${CONTINUE_RUN:-}" ] && [ "$SCRATCH" != 1 ]; then
     test -r "$RESUME"
     test -r "$(dirname "$RESUME")/pai/best_model.pt"   # PAI reloads it at the first switch
 fi
@@ -147,14 +162,14 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --num-layers 12 \
     --num-heads 3 \
     --patch-size 16 \
-    --batch-size 512 \
+    --batch-size 1024 \
     --accum-freq 1 \
     "${PRECISION[@]}" \
     --mlp-head \
     --torchvision-inception-crop \
     --epochs "$EPOCHS" \
-    --lr 5e-4 \
-    --log-steps 500 \
+    --lr 1e-3 \
+    --log-steps 250 \
     --workers $((SLURM_CPUS_PER_TASK - 2)) \
     "${START_ARGS[@]}" \
     "${PAI_ARGS[@]}" \
