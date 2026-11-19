@@ -166,12 +166,13 @@ pai_setup.add_arguments(parser)
 best_acc1 = 0
 
 
-def copy_wandb_history(run_id, last_step):
+def copy_wandb_history(run_id, last_step, steps_per_epoch):
     """Copy the scalars run_id logged up to last_step into the current W&B run.
 
     Stands in for W&B run forking, which is a private preview feature: charts of a resumed run
     then start at step 0. Media (e.g. PAI plots) are not copied; PAI's own plots already
-    include the restored history.
+    include the restored history. Rows without an epoch (runs from before it was logged) get
+    one from this run's steps_per_epoch, which assumes the source run used the same batch size.
     """
     source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{wandb.run.project}/{run_id}")
     rows = 0
@@ -182,6 +183,7 @@ def copy_wandb_history(run_id, last_step):
         data = {k: v for k, v in row.items()
                 if not k.startswith('_') and v is not None and not isinstance(v, dict)}
         if data:
+            data.setdefault('epoch', step / steps_per_epoch)
             wandb.log(data, step=step)
             rows += 1
     print(f"=> copied {rows} W&B history rows (steps <= {last_step}) from run '{run_id}'")
@@ -488,6 +490,8 @@ def main_worker(gpu, args):
 
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.total_batch_size)
+    # Logged as 'epoch' with every W&B entry, so runs with different batch sizes line up.
+    args.steps_per_epoch = n / args.total_batch_size
     args.specified_steps = {round(n * epoch / args.total_batch_size) for epoch in args.log_epoch}
     args.specified_steps.add(total_steps)
 
@@ -552,10 +556,14 @@ def main_worker(gpu, args):
             resume='auto',
             config=vars(args),
         )
+        # Plot everything against epochs (step / steps per epoch) by default; _step stays available.
+        wandb.define_metric('epoch')
+        for name in ('train/*', 'val/*', 'pai/*', 'lr', 'l2_*', 'data_time', 'batch_time', 'samples_*'):
+            wandb.define_metric(name, step_metric='epoch')
         params_file = os.path.join(args.logs, args.name, "params.txt")
         wandb.save(params_file)
         if args.wandb_history_from and args.start_step:
-            copy_wandb_history(args.wandb_history_from, args.start_step)
+            copy_wandb_history(args.wandb_history_from, args.start_step, args.steps_per_epoch)
 
     # PAI replaces modules when it adds dendrites, so PAI runs stay uncompiled.
     if not args.pai:
@@ -635,7 +643,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             optimizer, scheduler = pai_setup.setup_optimizer(model, args)
         image_data = pai_images.collect(start_step, wandb if args.wandb and is_primary(args) else None)
         if args.wandb and is_primary(args):
-            wandb.log({**pai_setup.stats(), **image_data}, step=start_step)
+            wandb.log({**pai_setup.stats(), **image_data, 'epoch': start_step / args.steps_per_epoch},
+                      step=start_step)
 
     # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
     # the source run's best model (which PAI reloads at a switch) after its first step.
@@ -752,7 +761,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "samples_per_second_per_gpu": samples_per_second_per_gpu,
                     "lr": optimizer.param_groups[0]['lr'],
                     "l2_grads": l2_grads.item(),
-                    "l2_params": math.sqrt(l2_params)
+                    "l2_params": math.sqrt(l2_params),
+                    "epoch": step / args.steps_per_epoch,
                 }
                 # Keep this step open for validation, PAI stats and plots.
                 pai_validation = args.pai and (step % args.log_steps == 0 or step in args.specified_steps)
@@ -786,7 +796,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     optimizer, scheduler = pai_setup.setup_optimizer(model, args)
                 image_data = pai_images.collect(step, wandb if args.wandb and is_primary(args) else None)
                 if args.wandb and is_primary(args):
-                    wandb.log({**pai_setup.stats(), **image_data}, step=step)
+                    wandb.log({**pai_setup.stats(), **image_data, 'epoch': step / args.steps_per_epoch},
+                              step=step)
 
             if is_primary(args):
                 ckpt = {
@@ -868,6 +879,7 @@ def validate(val_loader, model, step, device, args):
             'val/loss': losses.avg,
             'val/acc@1': top1.avg,
             'val/acc@5': top5.avg,
+            'epoch': step / args.steps_per_epoch,
         }
         # PAI adds stats and images to the same step immediately after validation.
         wandb.log(log_data, step=step, commit=not (args.pai and not args.evaluate))
