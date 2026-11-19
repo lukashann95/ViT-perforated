@@ -508,10 +508,12 @@ def main_worker(gpu, args):
         drop_last=True, multiprocessing_context='spawn',
         prefetch_factor=1, persistent_workers=True)
 
+    # Persistent: spawned workers re-import main.py, torch and PAI, which took ~110 s per
+    # validation on Delta (~40 s on riddle). With one validation per epoch that was ~28% of runtime.
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.prefetch_factor * args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler,
-        multiprocessing_context='spawn', prefetch_factor=1)
+        multiprocessing_context='spawn', prefetch_factor=1, persistent_workers=True)
 
     if not args.pai:
         scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
