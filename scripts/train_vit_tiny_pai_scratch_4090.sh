@@ -12,14 +12,14 @@
 # batch 256, so validation (and PAI scoring) runs every 1000 steps, about once per epoch. The
 # warmup is 8 epochs as in the baseline: 8000 steps at batch 256 (it has to finish before PAI's
 # earliest switch, 10 validations = 10000 steps).
-# Precision: FP32 with TF32 tensor cores; AMP=1 uses fp16 AMP instead.
+# Precision: FP32 (with TF32 tensor cores for matmuls), never fp16 mixed precision (--amp).
 #
 # Data: uses the ImageFolder copy in $IMAGENET if setup_machine.sh unpacked one (UNPACK=1).
 # Otherwise it unpacks the parquet shards there once (~25 GB, kept for later runs).
 #
 # Optional settings (environment variables):
 #   LR, WD, BATCH, LOG_STEPS, PAI_WARMUP, EPOCHS (safety cap; PAI ends the run), MAX_DENDRITES,
-#   PAI_TARGET, PAI_MODE (pb | gd), AMP=1, TAG (appended to the run name),
+#   PAI_TARGET, PAI_MODE (pb | gd), TAG (appended to the run name),
 #   DATA_DIR, IMAGENET, PARQUET_DIR (same defaults as setup_machine.sh), LOG_ROOT (default ~/runs)
 
 set -euo pipefail
@@ -66,7 +66,6 @@ case "$PAI_MODE" in
 esac
 PRECISION=(--tf32)
 PREC_TAG=fp32
-if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
 RUN_NAME="vit_tiny_pai_scratch_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}_${PREC_TAG}_b${BATCH}${TAG:+_$TAG}_20pct_$(date +%Y%m%d_%H%M)"
 
 # Credentials (WANDB_API_TOKEN, PAIEMAIL, PAITOKEN) from the .env that setup_machine.sh checked.
