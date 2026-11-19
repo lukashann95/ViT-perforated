@@ -651,6 +651,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         step_correct = 0.0
         # The phase only changes at validations, so it is fixed for the whole step.
         dendrite_phase = args.pai and pai_setup.in_dendrite_phase()
+        # Neuron phases accumulate the --accum-freq microbatches into one optimizer step (exact).
+        # Dendrite phases step after every microbatch instead: Perforated Backpropagation trains
+        # candidates inside optimizer.step() from what each forward pass recorded, so
+        # accumulating would not equal one large batch. Candidates then train on microbatches.
+        dendrite_skipped = 0
 
         for img, trt1, trt2 in chunk(args.accum_freq, device, images, target1, target2):
             # compute output
@@ -669,7 +674,19 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             if dendrite_phase:
                 # PAI's documented AMP pattern: a plain, unscaled backward in dendrite ('p')
                 # phases. PAI's dendrite correlation learning is not invariant to the loss scale.
-                (loss / args.accum_freq).backward()
+                # Each microbatch is its own optimizer step, so its loss is not divided.
+                loss.backward()
+                # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
+                # during the (unscaled) backward, so GradScaler is bypassed as PAI documents.
+                # Without loss scaling fp16 should not overflow; if it ever does, skip the update
+                # rather than let a non-finite error signal turn the candidate weights into NaN.
+                if pai_setup.dendrite_grads_overflowed():
+                    dendrite_skipped += 1
+                    pai_setup.DIAG['last_scale_drop_step'] = step
+                    print(f"=> non-finite gradient in dendrite step {step}: skipped the update")
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
             else:
                 scaler.scale(loss / args.accum_freq).backward()
 
@@ -680,18 +697,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         interval_samples += images.size(0)
 
         if dendrite_phase:
-            # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
-            # during the (unscaled) backward, so GradScaler is bypassed as PAI documents. Without
-            # loss scaling fp16 should not overflow; if it ever does, skip the update rather
-            # than let a non-finite error signal turn the candidate dendrite weights into NaN.
+            # The optimizer already stepped once per microbatch above.
             l2_grads = torch.zeros((), device=device)
-            if pai_setup.dendrite_grads_overflowed():
-                optimizer_updated = False
-                pai_setup.DIAG['last_scale_drop_step'] = step
-                print(f"=> non-finite gradient in dendrite step {step}: skipped the update")
-            else:
-                optimizer.step()
-                optimizer_updated = True
+            optimizer_updated = dendrite_skipped == 0
         else:
             # Unscale only after all microbatches have accumulated, before clipping.
             scaler.unscale_(optimizer)

@@ -20,6 +20,9 @@
 # Precision: FP32 with TF32 tensor cores by default (no fp16 AMP); AMP=1 restores --amp.
 # Batch 1024 in one pass (no gradient accumulation) at LR 1e-3, as the 20% from-scratch baseline
 # (which reaches 1024 with 4x256 accumulation); validation every 250 steps (one epoch).
+# ACCUM=k splits each batch into k microbatches: neuron phases accumulate them into one step (the
+# same update as one 1024 pass), dendrite phases step once per microbatch (PB candidates train
+# on 1024/k). Adds _acc<k> to the run name. ACCUM=4 matches 24 GB consumer GPUs.
 # PAI_MODE: pb (default, Perforated Backpropagation / cascade correlation) or gd (dendrites trained
 # by gradient descent with the neurons, PAI's open-source mode).
 # DENDRITE_LOSS=covariance (pb only): perforatedbp's older CovarianceDendriteLoss instead of the
@@ -34,7 +37,7 @@
 # CONTINUE_RUN=<run name>: continue that run after a timeout from its last checkpoint (main.py
 # --resume; dendrites allowed, but it must have been saved in a neuron phase), in the same log
 # directory. W&B gets a new run, <run name>_cont<job id>, with the original run's history up to
-# the checkpoint copied in. Pass the original ARM/CONTROL/PAI_MODE/DENDRITE_LOSS/AMP/MAX_DENDRITES too:
+# the checkpoint copied in. Pass the original ARM/CONTROL/PAI_MODE/DENDRITE_LOSS/AMP/ACCUM/MAX_DENDRITES:
 #   sbatch --export=ALL,DENDRITE_LOSS=covariance,CONTINUE_RUN=vit_tiny_pai_resume_11_..._1419 \
 #       scripts/delta_pai_resume.sbatch
 
@@ -89,13 +92,16 @@ case "${DENDRITE_LOSS:-default}" in
     covariance) MODE_ARGS+=(--pai-dendrite-loss covariance); LOSS_TAG=_covloss ;;
     *) echo "DENDRITE_LOSS must be default or covariance" >&2; exit 1 ;;
 esac
+ACCUM=${ACCUM:-1}
+ACCUM_TAG=
+[ "$ACCUM" = 1 ] || ACCUM_TAG=_acc$ACCUM
 PRECISION=(--tf32)
 PREC_TAG=fp32
 if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
 SCRATCH=${SCRATCH:-0}
 KIND=resume
 [ "$SCRATCH" = 1 ] && KIND=scratch
-RUN_PREFIX="vit_tiny_pai_${KIND}_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}_20pct_"
+RUN_PREFIX="vit_tiny_pai_${KIND}_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}${ACCUM_TAG}_20pct_"
 if [ -n "${CONTINUE_RUN:-}" ]; then
     case "$CONTINUE_RUN" in
         "$RUN_PREFIX"*) ;;
@@ -163,7 +169,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --num-heads 3 \
     --patch-size 16 \
     --batch-size 1024 \
-    --accum-freq 1 \
+    --accum-freq "$ACCUM" \
     "${PRECISION[@]}" \
     --mlp-head \
     --torchvision-inception-crop \
