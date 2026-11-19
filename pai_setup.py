@@ -213,9 +213,6 @@ def check_args(parser, args):
         parser.error('PAI runs support a single GPU only; pass --gpu 0')
     if args.resume and (args.pai_resume or args.pai_init):
         parser.error('--resume continues a PAI run; it excludes --pai-resume and --pai-init')
-    if args.accum_freq != 1:
-        # PAI stores one set of dendrite outputs and neuron errors per optimizer step.
-        parser.error('PAI runs need --accum-freq 1')
 
 
 def plain_key(key, target):
