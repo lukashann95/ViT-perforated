@@ -6,6 +6,7 @@ import math
 import os
 import random
 import shutil
+import tempfile
 import time
 import warnings
 from datetime import datetime
@@ -154,7 +155,7 @@ parser.add_argument('--name', default=None, type=str,
 parser.add_argument("--report-to", default='', type=str,
                     help="Options are ['wandb']")
 parser.add_argument("--wandb-history-from", default='', type=str, metavar='RUN_ID',
-                    help="W&B run (same entity/project) whose logged scalars up to the resume step "
+                    help="W&B run (same entity/project) whose logged scalars and images up to the resume step "
                          "are copied into this run first, e.g. the run a --pai-resume checkpoint "
                          "came from. W&B's own run forking is a private preview feature.")
 parser.add_argument("--wandb-name", default='', type=str, metavar='RUN_ID',
@@ -167,26 +168,50 @@ best_acc1 = 0
 
 
 def copy_wandb_history(run_id, last_step, steps_per_epoch):
-    """Copy the scalars run_id logged up to last_step into the current W&B run.
+    """Copy what run_id logged up to last_step into the current W&B run.
 
     Stands in for W&B run forking, which is a private preview feature: charts of a resumed run
-    then start at step 0. Media (e.g. PAI plots) are not copied; PAI's own plots already
-    include the restored history. Rows without an epoch (runs from before it was logged) get
-    one from this run's steps_per_epoch, which assumes the source run used the same batch size.
+    then start at step 0. Scalars are copied directly; images (e.g. PAI plots) are downloaded from
+    the source run and logged again at their original steps. Rows without an epoch (runs from
+    before it was logged) get one from this run's steps_per_epoch, which assumes the source run
+    used the same batch size.
     """
     source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{wandb.run.project}/{run_id}")
-    rows = 0
-    for row in source.scan_history(page_size=1000):
-        step = row.get('_step')
-        if step is None or step > last_step:
-            continue
-        data = {k: v for k, v in row.items()
-                if not k.startswith('_') and v is not None and not isinstance(v, dict)}
-        if data:
-            data.setdefault('epoch', step / steps_per_epoch)
-            wandb.log(data, step=step)
-            rows += 1
-    print(f"=> copied {rows} W&B history rows (steps <= {last_step}) from run '{run_id}'")
+    rows = images = 0
+    with tempfile.TemporaryDirectory() as media_dir:
+        for row in source.scan_history(page_size=1000):
+            step = row.get('_step')
+            if step is None or step > last_step:
+                continue
+            data = {}
+            for key, value in row.items():
+                if key.startswith('_') or value is None:
+                    continue
+                if not isinstance(value, dict):
+                    data[key] = value
+                elif value.get('_type') == 'image-file' and value.get('path'):
+                    image = copy_wandb_image(source, value, media_dir)
+                    if image is not None:
+                        data[key] = image
+                        images += 1
+            if data:
+                data.setdefault('epoch', step / steps_per_epoch)
+                wandb.log(data, step=step)
+                rows += 1
+    print(f"=> copied {rows} W&B history rows with {images} images (steps <= {last_step}) "
+          f"from run '{run_id}'")
+
+
+def copy_wandb_image(source, entry, media_dir):
+    """Download one logged image of the source run; returns a wandb.Image, or None on failure."""
+    try:
+        source.file(entry['path']).download(root=media_dir, replace=True)
+        # wandb.log copies the file into this run's media directory, so media_dir may go after.
+        return wandb.Image(os.path.join(media_dir, entry['path']), caption=entry.get('caption'))
+    except Exception as exc:
+        # A missing plot must not abort the training job.
+        warnings.warn(f"Could not copy W&B image {entry['path']}: {exc}")
+        return None
 
 
 def normalize(images):
