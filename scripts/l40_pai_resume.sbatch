@@ -47,8 +47,10 @@
 # Same training settings as delta_pai_resume.sbatch: batch 1024 in one pass, no gradient
 # accumulation, at LR 1e-3 (fits the L40's 48 GB in FP32 + TF32), validation every 250 steps.
 # Other settings as there:
-#   AMP=1, PAI_MODE=pb|gd, DENDRITE_LOSS=covariance, MAX_DENDRITES, PAI_TARGET, EPOCHS,
+#   AMP=1, PAI_MODE=pb|gd, DENDRITE_LOSS=covariance, MAX_DENDRITES, PAI_TARGET,
 #   CONTINUE_RUN=<run name> (continue a timed-out run; pass its original settings too).
+# EPOCHS (default 350) is the total, including the epochs of the run RESUME comes from, and only a
+# safety cap: PAI ends the run when it stops improving.
 # Paths, if setup_machine.sh ran with non-default ones: REPO, VENV, DATA_VENV, DATA_DIR,
 # PARQUET_DIR, LOG_ROOT (default <repo parent>/runs), LOCAL (the unpack directory).
 
@@ -73,7 +75,7 @@ LOCAL=${LOCAL:-${SLURM_TMPDIR:-/tmp/${USER:-$(id -un)}}/imagenet_$JOB_ID}
 
 ARM=${ARM:-9,10,11}
 PAI_TARGET=${PAI_TARGET:-ln_mlp}
-EPOCHS=${EPOCHS:-300}
+EPOCHS=${EPOCHS:-350}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
 PAI_PATIENCE=${PAI_PATIENCE:-5}
 PAI_N_EPOCHS_TO_SWITCH=${PAI_N_EPOCHS_TO_SWITCH:-15}

@@ -12,34 +12,56 @@ output stay on the host machine and are mounted into the container.
   Check with `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`.
 - About 25 GB of disk for the dataset, plus 40 GB free on a fast local disk for each running job.
 
-## 1. Build the image
+## 1. Get the repository
 
 ```bash
-git clone <repo url> ViT-perforated && cd ViT-perforated
+git clone https://github.com/lukashann95/ViT-perforated.git && cd ViT-perforated
 git switch l40-pai-resume
+```
+
+You need the repository in both cases below, for `docker/run_l40.sh`. Run all later commands from
+this folder.
+
+## 2. Get the image and the keys
+
+Use one of the two ways, depending on what you were sent. To send them to someone, see
+[Sharing the image or the keys](#sharing-the-image-or-the-keys).
+
+### Option A: you were sent a `.env` file
+
+Build the image from the Dockerfile. The build downloads about 5 GB:
+
+```bash
 docker build -f docker/Dockerfile -t vit-perforated-l40 .
 ```
 
-The build downloads about 5 GB. If you were given the image as a file instead, load it with
-`docker load -i vit-perforated-l40.tar.gz`.
-
-## 2. Add your keys
-
-Skip this step if you were given the `vit-perforated-l40:keys` image, which has the keys built
-in. `docker/run_l40.sh` uses that image automatically when the machine has it. Otherwise:
+Put the `.env` you were sent in the repository folder (next to `.env.example`), and make it
+readable only by you:
 
 ```bash
-cp .env.example .env && chmod 600 .env
-nano .env    # fill in WANDB_API_TOKEN, PAIEMAIL and PAITOKEN
+cp /path/to/received/.env .env && chmod 600 .env
 ```
 
-`.env` is mounted read-only when the container runs. It is never copied into the plain image. A
-`.env` also overrides the keys built into the `:keys` image.
+`docker/run_l40.sh` mounts `.env` into the container read-only at every run, and the build never
+copies it into the image (`.dockerignore` excludes it). To use your own keys instead, create the
+file from the template with `cp .env.example .env`, then fill in `WANDB_API_TOKEN`, `PAIEMAIL`
+and `PAITOKEN`.
 
-To make a `:keys` image for someone else, build the plain image and run `docker/bake_keys.sh`.
-Anyone who has that image can read the keys out of it, so send it only as a file
-(`docker save vit-perforated-l40:keys | gzip > vit-perforated-l40-keys.tar.gz`), never push it to a
-public registry, and remember that every run started from it is logged under your W&B user.
+### Option B: you were sent the image file `vit-perforated-l40-keys.tar.gz`
+
+Load it. The keys are built in, so you need no `.env` and no build:
+
+```bash
+docker load -i vit-perforated-l40-keys.tar.gz    # prints: Loaded image: vit-perforated-l40:keys
+```
+
+`docker/run_l40.sh` uses the `vit-perforated-l40:keys` image automatically when the machine has
+it. A `.env` in the repository folder would override the built-in keys.
+
+### Either way: after code updates
+
+The container runs the copy of the code inside the image, not the files in your checkout. After a
+`git pull` with Option A, rebuild the image. With Option B, ask for a new image file.
 
 ## 3. Run setup
 
@@ -61,8 +83,10 @@ The run starts in the background, and the script prints the commands to follow a
 The job first unpacks the shards to `~/vit-data/unpack`, which takes a few minutes, and deletes
 them again when it ends. Runs go to `~/vit-data/runs/<run name>` and to W&B.
 
-To resume from a pre-switch checkpoint, put the snapshot folder under `~/vit-data/checkpoints/`.
-The folder must keep its `pai/best_model.pt`. Then:
+To resume from the pre-switch checkpoint of a run that uploaded it to W&B, use
+`RESUME_WANDB=<run name>` (see [Checkpoints on W&B](#checkpoints-on-wb)). For a snapshot folder
+copied from another machine, put it under `~/vit-data/checkpoints/`, keeping its
+`pai/best_model.pt`. Then:
 
 ```bash
 docker/run_l40.sh train    # default: checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000
@@ -76,7 +100,10 @@ Other settings are passed the same way. The full list is in the header of
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| `SCRATCH` | `0` | `1`: train from random initialization instead of resuming |
+| `RESUME` | the step-61000 snapshot | pre-switch checkpoint to resume from (container path) |
 | `ARM` | `9,10,11` | layers with dendrites: a list, one layer (`11`), a range (`6-11`) or `control` |
+| `EPOCHS` | `350` | maximum epochs, counting those of the run `RESUME` comes from; PAI usually ends the run earlier |
 | `PAI_PATIENCE` | `5` | validations without improvement before the LR drops |
 | `PAI_N_EPOCHS_TO_SWITCH` | `15` | minimum validations in a neuron phase before PAI may switch |
 | `MAX_DENDRITES` | `2` | maximum number of dendrite rounds |
@@ -94,6 +121,10 @@ GPU=1 HOST_DATA=/big/disk/vit-data HOST_UNPACK=/local/nvme/unpack docker/run_l40
 - `HOST_DATA`: the data folder on the host (default `~/vit-data`).
 - `HOST_UNPACK`: where each job unpacks ImageNet (default `$HOST_DATA/unpack`).
 - `ENV_FILE`: the keys file (default: the repo's `.env`).
+- `IMAGE`: the image to run (default `vit-perforated-l40:keys` if the machine has it, otherwise
+  `vit-perforated-l40`).
+- `DOCKER_ARGS`: extra `docker run` options. If downloads hang or fail with "Temporary failure
+  resolving", for example on a VPN, try `DOCKER_ARGS="--network host"`.
 
 To get a shell with the same mounts, run `docker/run_l40.sh shell`.
 
@@ -128,6 +159,31 @@ docker/run_l40.sh train RESUME_WANDB=<run name>            # e.g. other layers: 
 
 This downloads that checkpoint to `~/vit-data/checkpoints/<run name>/archive/pre_switch/`, resumes
 from it with `--pai-resume`, and copies the source run's W&B history up to that step.
+
+## Sharing the image or the keys
+
+Whoever sends the keys does this on their own machine, from the repository folder.
+
+- **Option A, send the `.env`:** the file is tiny. Send it over a private channel (for example
+  `scp`, or a direct message), never in a git commit.
+- **Option B, send the image:** build the plain image, add the keys, and save it to a file of
+  about 3.3 GB:
+
+  ```bash
+  docker build -f docker/Dockerfile -t vit-perforated-l40 .
+  docker/bake_keys.sh
+  (umask 077; docker save vit-perforated-l40:keys | gzip -1 > ~/vit-perforated-l40-keys.tar.gz)
+  ```
+
+  Send the file directly, for example with `rsync -P ~/vit-perforated-l40-keys.tar.gz
+  <user>@<host>:~/`, or with an end-to-end encrypted tool such as `croc`. A cloud drive also
+  works if the file is shared with that one person only and deleted afterwards. Never push the
+  image to Docker Hub or any other public registry.
+
+Either way, the keys can be read by whoever receives them (`docker run ... cat .env` with the
+image), and every W&B run started with them is logged under the W&B user who owns
+`WANDB_API_TOKEN`. If the keys leak, revoke the W&B key at https://wandb.ai/authorize and ask
+PerforatedAI for a new token.
 
 ## On a Slurm cluster
 
