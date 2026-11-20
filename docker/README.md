@@ -215,7 +215,10 @@ sbatch -p <partition> -A <account> --export=ALL,RESUME_WANDB=<run name> scripts/
 sbatch -p <partition> -A <account> --export=ALL,ARM=11,SCRATCH=1 scripts/l40_pai_resume.sbatch          # other layers
 ```
 
-Use your cluster's partition and account; the script's header lists every setting. Without Docker,
+Use your cluster's partition and account; the script's header lists every setting. A job may run
+for up to 48 hours. If your partition allows less, add for example `--time=24:00:00` and
+continue the run afterwards with `CONTINUE_RUN` (see [4. Train](#4-train)). With Docker there is
+no time limit. Without Docker,
 paths are host paths: the data is in `<repo parent>/imagenet_1k_resized_256`, runs go to
 `<repo parent>/runs`, the job unpacks the data to `$SLURM_TMPDIR` (or `/tmp`), the keys are read
 from the repository's `.env`, and the Slurm log is `slurm-vit-pai-l40-<job id>.out` in the folder

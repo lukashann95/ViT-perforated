@@ -5,10 +5,11 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=slurm-%x-%j.out
 # Partition, account and GPU type differ per cluster: pass them at submission (-p, -A, and e.g.
-# --gres=gpu:l40:1 if the cluster wants the GPU type named), or add #SBATCH lines here.
+# --gres=gpu:l40:1 if the cluster wants the GPU type named), or add #SBATCH lines here. If the
+# partition allows less than 48 hours, pass a shorter --time and continue with CONTINUE_RUN.
 
 # L40 version of scripts/delta_pai_resume.sbatch, for a machine set up with
 # scripts/setup_machine.sh (default settings: .venv and .venv-data in the repo, parquet shards in
