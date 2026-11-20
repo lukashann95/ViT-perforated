@@ -75,25 +75,47 @@ safe because it skips the steps that are already done.
 
 ## 4. Train
 
+Every run puts dendrites on layers 9, 10 and 11 unless you set `ARM`. Pick where it starts:
+
+| Start from | Command |
+| --- | --- |
+| scratch (random initialization) | `docker/run_l40.sh train SCRATCH=1` |
+| a run's W&B `pre_switch` checkpoint | `docker/run_l40.sh train RESUME_WANDB=<run name>` |
+| a pre-switch snapshot on disk | `docker/run_l40.sh train RESUME=/data/checkpoints/<run>/archive/<snapshot>/checkpoint.pth.tar` |
+
+`train` with none of these settings does not start from scratch. It resumes from the step-61000
+snapshot of `vit_tiny_pai_scratch_11_20pct_20261111_0433`, which exists only on Delta, so the job
+stops at once unless you have copied that folder to
+`~/vit-data/checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000/`.
+
+What the starting points mean:
+
+- **`SCRATCH=1`** trains a new model, with a linear LR warmup over the first 2000 steps
+  (`PAI_WARMUP`). PAI switches to a dendrite phase once validation stops improving.
+- **`RESUME_WANDB=<run name>`** downloads the `pre_switch` checkpoint of that run (see
+  [Checkpoints on W&B](#checkpoints-on-wb)) to `~/vit-data/checkpoints/<run name>/archive/pre_switch/`.
+  It then continues the run's neuron phase from there, with this run's layers, and copies the
+  source run's W&B history up to that step. Combine it with `ARM` to try other layers from the same
+  starting point.
+- **`RESUME=<path>`** does the same from a snapshot folder you copied yourself, for example a
+  run's `archive/pre_switch/` folder. The folder must hold both `checkpoint.pth.tar` and
+  `pai/best_model.pt`. Paths inside `VAR=value` are container paths: `~/vit-data` on the host is
+  `/data` in the container.
+
+The run starts in the background, and the script prints the commands to follow and stop it. The
+log is also saved to `~/vit-data/runs/docker-<time>.out`. The job first unpacks the shards to
+`~/vit-data/unpack`, which takes a few minutes, and deletes them again when it ends. Runs go to
+`~/vit-data/runs/<run name>` and to W&B.
+
+To continue a run that was stopped, from its last checkpoint on disk, pass its run name together
+with the settings it was started with. For example, for a run started with `SCRATCH=1`:
+
 ```bash
-docker/run_l40.sh train SCRATCH=1    # fresh run: dendrites on layers 9, 10 and 11
+docker/run_l40.sh train SCRATCH=1 CONTINUE_RUN=vit_tiny_pai_scratch_9_10_11_ln_mlp_pb_fp32_20pct_<date>
 ```
 
-The run starts in the background, and the script prints the commands to follow and stop it.
-The job first unpacks the shards to `~/vit-data/unpack`, which takes a few minutes, and deletes
-them again when it ends. Runs go to `~/vit-data/runs/<run name>` and to W&B.
-
-To resume from the pre-switch checkpoint of a run that uploaded it to W&B, use
-`RESUME_WANDB=<run name>` (see [Checkpoints on W&B](#checkpoints-on-wb)). For a snapshot folder
-copied from another machine, put it under `~/vit-data/checkpoints/`, keeping its
-`pai/best_model.pt`. Then:
-
-```bash
-docker/run_l40.sh train    # default: checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000
-docker/run_l40.sh train RESUME=/data/checkpoints/<run>/archive/<snapshot>/checkpoint.pth.tar
-```
-
-Paths inside `VAR=value` are container paths: `~/vit-data` on the host is `/data` in the container.
+The run must have been stopped in a neuron phase. W&B shows the continuation as a new run,
+`<run name>_cont<time>`, with the original run's history copied in.
 
 Other settings are passed the same way. The full list is in the header of
 `scripts/l40_pai_resume.sbatch`:
@@ -101,7 +123,7 @@ Other settings are passed the same way. The full list is in the header of
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `SCRATCH` | `0` | `1`: train from random initialization instead of resuming |
-| `RESUME` | the step-61000 snapshot | pre-switch checkpoint to resume from (container path) |
+| `RESUME` | the Delta step-61000 snapshot | pre-switch checkpoint to resume from (container path) |
 | `ARM` | `9,10,11` | layers with dendrites: a list, one layer (`11`), a range (`6-11`) or `control` |
 | `EPOCHS` | `350` | maximum epochs, counting those of the run `RESUME` comes from; PAI usually ends the run earlier |
 | `PAI_PATIENCE` | `5` | validations without improvement before the LR drops |
@@ -150,15 +172,8 @@ import wandb
 path = wandb.Api().artifact("IdlF26Group40/ViT-perforated/checkpoint-<run name>:best").download()
 ```
 
-To start a new run from the `pre_switch` checkpoint (the start of the first dendrite phase), on
-any machine:
-
-```bash
-docker/run_l40.sh train RESUME_WANDB=<run name>            # e.g. other layers: add ARM=11
-```
-
-This downloads that checkpoint to `~/vit-data/checkpoints/<run name>/archive/pre_switch/`, resumes
-from it with `--pai-resume`, and copies the source run's W&B history up to that step.
+To start a new run from a `pre_switch` checkpoint, use `RESUME_WANDB=<run name>` (see
+[4. Train](#4-train)).
 
 ## Sharing the image or the keys
 
@@ -188,6 +203,23 @@ PerforatedAI for a new token.
 ## On a Slurm cluster
 
 Most clusters do not allow Docker. Without Docker, run `scripts/setup_machine.sh` on the login
-node and submit `scripts/l40_pai_resume.sbatch` with `sbatch`; the header of that script explains
-how. To use this image there anyway, convert it with Apptainer:
+node to install the environments, check the keys and download the data. Then submit
+`scripts/l40_pai_resume.sbatch` from the repository folder. It takes the same settings as
+`docker/run_l40.sh train`, passed with `--export`, and has the same default: without `SCRATCH`,
+`RESUME_WANDB` or `RESUME`, it resumes from the Delta snapshot and stops if that is missing.
+
+```bash
+cd ViT-perforated
+sbatch -p <partition> -A <account> --export=ALL,SCRATCH=1 scripts/l40_pai_resume.sbatch                 # from scratch
+sbatch -p <partition> -A <account> --export=ALL,RESUME_WANDB=<run name> scripts/l40_pai_resume.sbatch   # from a W&B pre_switch checkpoint
+sbatch -p <partition> -A <account> --export=ALL,ARM=11,SCRATCH=1 scripts/l40_pai_resume.sbatch          # other layers
+```
+
+Use your cluster's partition and account; the script's header lists every setting. Without Docker,
+paths are host paths: the data is in `<repo parent>/imagenet_1k_resized_256`, runs go to
+`<repo parent>/runs`, the job unpacks the data to `$SLURM_TMPDIR` (or `/tmp`), the keys are read
+from the repository's `.env`, and the Slurm log is `slurm-vit-pai-l40-<job id>.out` in the folder
+you submitted from.
+
+To use the Docker image on such a cluster anyway, convert it with Apptainer:
 `apptainer build vit.sif docker-daemon://vit-perforated-l40:latest`.
