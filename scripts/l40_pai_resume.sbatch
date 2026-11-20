@@ -15,13 +15,22 @@
 # <repo parent>/imagenet_1k_resized_256/data, keys in <repo>/.env). The shards are unpacked to
 # node-local disk at the start of the job. Submit from the repo root:
 #   cd ViT-perforated
-#   sbatch -p <partition> -A <account> scripts/l40_pai_resume.sbatch          # layers 7, 9 and 11 in one run
+#   sbatch -p <partition> -A <account> scripts/l40_pai_resume.sbatch          # layers 9, 10 and 11 in one run
 #   sbatch -p <partition> -A <account> --export=ALL,ARM=7 scripts/l40_pai_resume.sbatch   # one layer
-#   for a in 7 9 11; do sbatch ... --export=ALL,ARM=$a scripts/l40_pai_resume.sbatch; done  # 3 separate arms
+#   for a in 9 10 11; do sbatch ... --export=ALL,ARM=$a scripts/l40_pai_resume.sbatch; done  # 3 separate arms
+# Without Slurm (e.g. in the Docker image, see docker/README.md), run it with bash instead:
+#   ARM=9,10,11 bash scripts/l40_pai_resume.sbatch
 #
-# ARM: a comma list of layers (7,9,11, the default; run name tag 7_9_11), one layer (7), an
+# ARM: a comma list of layers (9,10,11, the default; run name tag 9_10_11), one layer (7), an
 # inclusive range (6-11), or control (= layer 11 with CONTROL=1). CONTROL=1 keeps the wrapping
 # without ever adding dendrites.
+# PAI schedule: PAI_PATIENCE (default 5) validations without improvement before the LR drops
+# (--pai-patience), and at least PAI_N_EPOCHS_TO_SWITCH (default 15) validations in a neuron
+# phase before PAI may switch to a dendrite phase (--pai-n-epochs-to-switch).
+# W&B checkpoints (--wandb-checkpoints): the run keeps three checkpoints in the W&B model artifact
+# checkpoint-<run name>: 'last' (uploaded at every validation), 'best' (best val acc@1) and
+# 'pre_switch' (the last neuron-only state before PAI's first switch to dendrites, also kept on
+# disk in <run>/archive/pre_switch/). Older versions are deleted. WANDB_CKPT=0 turns this off.
 #
 # RESUME: the pre-switch main.py checkpoint to continue from (--pai-resume). Its directory must
 # also hold pai/best_model.pt. Default: the step-61000 snapshot of
@@ -29,6 +38,9 @@
 # <repo parent>/checkpoints/; copy that whole snapshot directory there from Delta, e.g.
 #   rsync -a <delta>:/projects/bjto/shared/checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000 \
 #       <repo parent>/checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/
+# RESUME_WANDB=<run name>: resume from that run's W&B pre-switch checkpoint instead, from any
+# machine: downloads checkpoint-<run name>:pre_switch (from WANDB_ENTITY/WANDB_PROJECT in .env) to
+# <repo parent>/checkpoints/<run name>/archive/pre_switch/ and sets RESUME to it.
 # SCRATCH=1 trains from random initialization instead (no RESUME needed), with a linear LR warmup
 # over PAI_WARMUP steps (default 2000).
 #
@@ -54,12 +66,22 @@ DATA_DIR=${DATA_DIR:-$(dirname "$REPO")}
 PARQUET=${PARQUET_DIR:-$DATA_DIR/imagenet_1k_resized_256/data}
 PYTHON=$VENV/bin/python
 LOG_ROOT=${LOG_ROOT:-$DATA_DIR/runs}
-LOCAL=${LOCAL:-${SLURM_TMPDIR:-/tmp/$USER}/imagenet_$SLURM_JOB_ID}
+# Outside Slurm: a timestamp as the job id, and all of this machine's cores.
+JOB_ID=${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}
+CPUS=${SLURM_CPUS_PER_TASK:-$(nproc)}
+LOCAL=${LOCAL:-${SLURM_TMPDIR:-/tmp/${USER:-$(id -un)}}/imagenet_$JOB_ID}
 
-ARM=${ARM:-7,9,11}
+ARM=${ARM:-9,10,11}
 PAI_TARGET=${PAI_TARGET:-ln_mlp}
 EPOCHS=${EPOCHS:-300}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
+PAI_PATIENCE=${PAI_PATIENCE:-5}
+PAI_N_EPOCHS_TO_SWITCH=${PAI_N_EPOCHS_TO_SWITCH:-15}
+CKPT_ARGS=()
+[ "${WANDB_CKPT:-1}" = 1 ] && CKPT_ARGS=(--wandb-checkpoints)
+if [ -n "${RESUME_WANDB:-}" ]; then
+    RESUME=$DATA_DIR/checkpoints/$RESUME_WANDB/archive/pre_switch/checkpoint.pth.tar
+fi
 RESUME=${RESUME:-$DATA_DIR/checkpoints/vit_tiny_pai_scratch_11_20pct_20261111_0433/archive/1111_234822_step61000/checkpoint.pth.tar}
 # The source run's W&B id is its log directory name (<run>/archive/<snapshot>/ or <run>/checkpoints/).
 SRC_DIR=${RESUME%%/archive/*}
@@ -113,10 +135,10 @@ if [ -n "${CONTINUE_RUN:-}" ]; then
     RUN_NAME=$CONTINUE_RUN
     CKPT_DIR=$LOG_ROOT/$RUN_NAME/checkpoints
     # The continued run overwrites checkpoint.pth.tar at its first validation; keep the start point.
-    CONTINUE_FROM=$CKPT_DIR/continue_job${SLURM_JOB_ID}.pth.tar
+    CONTINUE_FROM=$CKPT_DIR/continue_job${JOB_ID}.pth.tar
     cp "$CKPT_DIR/checkpoint.pth.tar" "$CONTINUE_FROM"
     STEP=$("$PYTHON" -c "import sys, torch; print(torch.load(sys.argv[1], map_location='cpu', weights_only=True)['step'])" "$CONTINUE_FROM")
-    WANDB_RUN=${RUN_NAME}_cont${SLURM_JOB_ID}
+    WANDB_RUN=${RUN_NAME}_cont${JOB_ID}
     echo "Continuing $RUN_NAME from step $STEP as W&B run $WANDB_RUN"
     START_ARGS=(--resume "$CONTINUE_FROM" --wandb-name "$WANDB_RUN" --wandb-history-from "$RUN_NAME")
     # Own W&B dir: the original's wandb-resume.json (left by the timeout) would make
@@ -142,6 +164,17 @@ test -x "$DATA_VENV/bin/python" || { echo "no pyarrow venv at $DATA_VENV: run sc
 if ! compgen -G "$PARQUET/train-*.parquet" >/dev/null || ! compgen -G "$PARQUET/val-*.parquet" >/dev/null; then
     echo "no train-*/val-*.parquet shards in $PARQUET (set PARQUET_DIR)" >&2; exit 1
 fi
+if [ -n "${RESUME_WANDB:-}" ] && [ -z "${CONTINUE_RUN:-}" ] && [ "$SCRATCH" != 1 ]; then
+    # Same layout as the run's archive/pre_switch/: checkpoint.pth.tar and pai/best_model.pt.
+    "$PYTHON" - "$RESUME_WANDB" "$(dirname "$RESUME")" <<'PY'
+import os, sys, wandb
+run, dest = sys.argv[1:]
+path = f"{os.environ.get('WANDB_ENTITY', 'IdlF26Group40')}/{os.environ.get('WANDB_PROJECT', 'ViT-perforated')}/checkpoint-{run}:pre_switch"
+artifact = wandb.Api(api_key=os.environ['WANDB_API_TOKEN']).artifact(path, type='model')
+artifact.download(dest)
+print(f"=> downloaded {path} (step {artifact.metadata.get('step')}) to {dest}")
+PY
+fi
 if [ -z "${CONTINUE_RUN:-}" ] && [ "$SCRATCH" != 1 ]; then
     if [ ! -r "$RESUME" ] || [ ! -r "$(dirname "$RESUME")/pai/best_model.pt" ]; then
         # PAI reloads pai/best_model.pt at the first switch.
@@ -162,7 +195,7 @@ fi
 trap 'rm -rf "$LOCAL"' EXIT
 echo "Unpacking ImageNet from $PARQUET to $LOCAL ($avail_gb GB free)..."
 start=$SECONDS
-"$DATA_VENV/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" "$PARQUET" "$LOCAL" --workers "$SLURM_CPUS_PER_TASK"
+"$DATA_VENV/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" "$PARQUET" "$LOCAL" --workers "$CPUS"
 echo "Unpacked in $((SECONDS - start)) s"
 
 export WANDB_DIR
@@ -172,7 +205,7 @@ mkdir -p "$WANDB_DIR"
 export OMP_NUM_THREADS=1
 
 cd "$REPO"
-echo "Run $RUN_NAME: layer(s) ${LAYERS[*]}, CONTROL=$CONTROL"
+echo "Run $RUN_NAME: layer(s) ${LAYERS[*]}, CONTROL=$CONTROL, patience $PAI_PATIENCE, n-epochs-to-switch $PAI_N_EPOCHS_TO_SWITCH"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 "$PYTHON" -u main.py "$LOCAL" \
     --gpu 0 \
@@ -190,12 +223,15 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --epochs "$EPOCHS" \
     --lr 1e-3 \
     --log-steps 250 \
-    --workers $((SLURM_CPUS_PER_TASK - 2)) \
+    --workers $((CPUS > 4 ? CPUS - 2 : 2)) \
     "${START_ARGS[@]}" \
     "${PAI_ARGS[@]}" \
     ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} \
     --pai-target "$PAI_TARGET" \
     --max-dendrites "$MAX_DENDRITES" \
+    --pai-patience "$PAI_PATIENCE" \
+    --pai-n-epochs-to-switch "$PAI_N_EPOCHS_TO_SWITCH" \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
-    --report-to wandb
+    --report-to wandb \
+    ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"}

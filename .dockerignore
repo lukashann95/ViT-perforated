@@ -1,0 +1,12 @@
+# Keys never go into the image: run_l40.sh mounts .env at run time.
+.env
+.env.*
+!.env.example
+# Built inside the image instead.
+.venv
+.venv-*
+.git
+.claude
+**/__pycache__
+notebooks
+pai_examples
