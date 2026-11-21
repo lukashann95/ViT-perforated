@@ -800,7 +800,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
         # Overflow skips the optimizer update, so also skip the LR update.
         # Advance before checkpointing so resume restores the next step's LR.
-        # PAI steps its plateau scheduler from validation scores instead.
+        # PAI steps its own scheduler at validations instead.
         if optimizer_updated and not args.pai:
             scheduler.step()
 
