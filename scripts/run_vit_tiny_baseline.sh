@@ -1,4 +1,13 @@
 #!/bin/bash
+#SBATCH --job-name=vit-baseline
+#SBATCH --account=bjto-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=/projects/bjto/lhann/runs/slurm-%j.out
 # Baseline benchmark: ViT-Tiny/16 (no PAI), 20% stratified ImageNet-1k subset,
 # FP32 with TF32 tensor-core matmuls/convs (--tf32; no effect on GPUs without TF32, e.g. V100),
 # single GPU. Effective batch BATCH (default 1024), split into microbatches to fit in memory.
@@ -10,19 +19,23 @@
 #   - .env in the repo with WANDB_API_TOKEN (W&B account must be in the IdlF26Group40 entity)
 #
 # Run (inside tmux), overriding anything that differs on your machine:
-#   REPO=~/ViT-perforated IMAGENET=~/data/imagenet ./run_vit_tiny_baseline.sh
+#   IMAGENET=~/data/imagenet ./scripts/run_vit_tiny_baseline.sh
+# On Delta, from the repo root (the #SBATCH lines are comments elsewhere; settings via --export):
+#   sbatch --export=ALL,ACCUM=1 scripts/run_vit_tiny_baseline.sh
+# Machine setup (dataset, workers, credentials, GPU) is in scripts/machine_env.sh.
 #
 # Settings (environment variables, all optional):
-#   REPO        repo path                         (default: $HOME/Anshu/ViT-perforated)
-#   IMAGENET    dataset path with train/ and val/ (default: $HOME/data/imagenet)
+#   REPO        repo path                         (default: this script's repo)
+#   IMAGENET    dataset path with train/ and val/ (default: $HOME/data/imagenet; Delta: unpacked
+#               to node-local disk, see machine_env.sh)
 #   EPOCHS      training epochs                   (default: 90)
 #   LOG_EPOCHS  extra checkpoint/validation epochs(default: "30 60")
 #   BATCH       effective batch size              (default: 1024)
 #   SCALING     how LR follows BATCH from the 1024 baseline (LR 1e-3):
 #               none (keep it), linear (x BATCH/1024) or sqrt (x sqrt(BATCH/1024)) (default: none)
 #   ACCUM       microbatches per step; 4 = 4x256. Use 8 (8x128) if you hit CUDA OOM. (default: BATCH/256)
-#   GPU         which GPU to use                  (default: 0)
-#   WORKERS     data-loading workers              (default: CPU cores - 1)
+#   GPU         which GPU to use                  (default: 0; under Slurm: the assigned one)
+#   WORKERS     data-loading workers              (default: CPU cores - 1; Slurm: CPUs - 2)
 #   RUN_NAME    run / W&B name; reuse it with --resume to continue a run
 #   WANDB_CKPT  1 uploads checkpoints to W&B as model artifact checkpoint-<RUN_NAME>, keeping the
 #               'last' (every validation) and 'best' versions; 0 turns it off (default: 1)
@@ -40,8 +53,9 @@
 #   RUN_NAME=<name> ./run_vit_tiny_baseline.sh --resume "<REPO>/logs/<name>/checkpoints/checkpoint.pth.tar"
 set -euo pipefail
 
-REPO="${REPO:-$HOME/Anshu/ViT-perforated}"
-IMAGENET="${IMAGENET:-$HOME/data/imagenet}"
+# sbatch runs a copy of this script, so under Slurm the repo is where sbatch was called from.
+REPO="${REPO:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}" && pwd)}"
+test -f "$REPO/scripts/machine_env.sh" || { echo "No $REPO/scripts/machine_env.sh (with sbatch, submit from the repo root)"; exit 1; }
 EPOCHS="${EPOCHS:-90}"
 LOG_EPOCHS="${LOG_EPOCHS:-30 60}"
 BATCH="${BATCH:-1024}"
@@ -65,17 +79,12 @@ fi
 LOG_ROOT="$REPO/logs"
 RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_20pct_${EPOCHS}ep${TAG}_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
 
-# Only show one GPU (with 2+ visible GPUs main.py takes its multi-GPU path and crashes).
-export CUDA_VISIBLE_DEVICES="${GPU:-0}"
-export OMP_NUM_THREADS=1
-# nproc honours OMP_NUM_THREADS, so unset it to get the real core count.
-WORKERS="${WORKERS:-$(( $(env -u OMP_NUM_THREADS nproc) - 1 ))}"
+test -f "$REPO/.env" || { echo "No $REPO/.env with WANDB_API_TOKEN"; exit 1; }
+if [ -n "${IMAGENET:-}" ]; then DATA=$IMAGENET; fi
+# Sets DATA, WORKERS, PYTHON, the W&B entity/project and the visible GPU.
+source "$REPO/scripts/machine_env.sh"
 
 cd "$REPO"
-test -d "$IMAGENET/train" || { echo "No $IMAGENET/train"; exit 1; }
-test -d "$IMAGENET/val"   || { echo "No $IMAGENET/val"; exit 1; }
-command -v uv >/dev/null  || { echo "uv not found"; exit 1; }
-test -f .env              || { echo "No $REPO/.env with WANDB_API_TOKEN"; exit 1; }
 
 # Fail fast if main.py lacks the W&B fix (otherwise periodic val/* metrics are dropped).
 grep -q "pai_validation = (step %" main.py \
@@ -86,14 +95,12 @@ if [ "${WANDB_CKPT:-1}" = 1 ]; then CKPT_ARGS=(--wandb-checkpoints); fi
 
 export WANDB_DIR="$LOG_ROOT/$RUN_NAME"
 mkdir -p "$WANDB_DIR"
-export WANDB_ENTITY="IdlF26Group40"
-export WANDB_PROJECT="ViT-perforated"
 
-echo "Run: $RUN_NAME | GPU: $CUDA_VISIBLE_DEVICES | epochs: $EPOCHS | batch: $BATCH | accum: $ACCUM | lr: $LR | wd: $WD | warmup: $WARMUP | workers: $WORKERS"
+echo "Run: $RUN_NAME | GPU: ${CUDA_VISIBLE_DEVICES:-all} | epochs: $EPOCHS | batch: $BATCH | accum: $ACCUM | lr: $LR | wd: $WD | warmup: $WARMUP | workers: $WORKERS"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # shellcheck disable=SC2086  # LOG_EPOCHS is a space-separated list on purpose
-uv run python -u main.py "$IMAGENET" \
+"$PYTHON" -u main.py "$DATA" \
     --gpu 0 \
     --train-fraction 0.2 \
     --subset-seed 42 \

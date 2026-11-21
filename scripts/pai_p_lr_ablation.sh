@@ -1,4 +1,13 @@
 #!/bin/bash
+#SBATCH --job-name=vit-plr-ablation
+#SBATCH --account=bjto-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=/projects/bjto/lhann/runs/slurm-%j.out
 # Dendrite-phase LR ablation for one plain (non-PAI) ViT-Tiny checkpoint: for each LR scale K,
 # perforate block 11 (TARGET, default its pre-norm and whole MLP) and train only the first
 # Perforated Backpropagation dendrite (p) phase for 25 epochs, cosine from K x PEAK_LR down to 0,
@@ -7,6 +16,8 @@
 #   CKPT=/path/model_best.pth.tar PEAK_LR=1e-3 BATCH=1024 scripts/pai_p_lr_ablation.sh
 # As one task-spooler job on riddle GPU 1:
 #   forgeq-gpu 1 -L plr env GPU=1 CKPT=... PEAK_LR=2.5e-4 BATCH=256 ~/ViT-perforated/scripts/pai_p_lr_ablation.sh
+# On Delta, from the repo root (the #SBATCH lines are comments elsewhere):
+#   sbatch --export=ALL,CKPT=...,PEAK_LR=1e-3,BATCH=1024 scripts/pai_p_lr_ablation.sh
 #
 # PEAK_LR is the neuron run's peak LR (the start of its cosine), for its effective batch BATCH.
 # With ACCUM=k the p phase steps once per BATCH/k microbatch, and --pai-p-lr-scaling linear
@@ -30,10 +41,11 @@
 # WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
 #   with GD it applies to every weight matrix (the baseline used 1e-4);
 # P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
-# default ln_mlp); DATA (ImageFolder root, default ~/data/imagenet);
-# LOGS (default ~/runs); GPU (default 0); WORKERS (default 14); WANDB=0 to skip W&B;
-# WANDB_ENTITY / WANDB_PROJECT (default IdlF26Group40 / ViT-perforated).
-# Needs PAIEMAIL/PAITOKEN (environment, ~/.pai_env or the repo's .env); W&B reads
+# default ln_mlp); LOGS (default ~/runs; Delta: /projects/bjto/$USER/runs); WANDB=0 to skip W&B.
+# DATA, GPU, WORKERS, WANDB_ENTITY / WANDB_PROJECT: see scripts/machine_env.sh
+# (defaults ~/data/imagenet, 0, CPU cores - 1, IdlF26Group40 / ViT-perforated; Delta unpacks the
+# dataset to node-local disk once for all scales).
+# Needs PAIEMAIL/PAITOKEN (environment, the repo's .env or ~/.pai_env); W&B reads
 # WANDB_API_TOKEN from .env.
 set -euo pipefail
 : "${CKPT:?set CKPT to a plain main.py checkpoint}"
@@ -44,10 +56,6 @@ SCALES=${SCALES:-0.01 0.1 1 10 100}
 P_EPOCHS=${P_EPOCHS:-25}
 LAYER=${LAYER:-11}
 TARGET=${TARGET:-ln_mlp}
-DATA=${DATA:-$HOME/data/imagenet}
-LOGS=${LOGS:-$HOME/runs}
-GPU=${GPU:-0}
-WORKERS=${WORKERS:-14}
 WD=${WD:-0}
 GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
@@ -67,16 +75,15 @@ else
 fi
 test -r "$CKPT"
 
-REPO=$(cd "$(dirname "$0")/.." && pwd)
-cd "$REPO"
-if [ -f "$HOME/.pai_env" ]; then set -a; source "$HOME/.pai_env"; set +a; fi
-if [ -f .env ]; then set -a; source .env; set +a; fi
+# sbatch runs a copy of this script, so under Slurm the repo is where sbatch was called from.
+REPO=${REPO:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}" && pwd)}
+test -f "$REPO/scripts/machine_env.sh" || { echo "No $REPO/scripts/machine_env.sh (with sbatch, submit from the repo root)" >&2; exit 1; }
+# Sets DATA, WORKERS, PYTHON, the PAI credentials, the W&B entity/project and the visible GPU.
+source "$REPO/scripts/machine_env.sh"
+LOGS=${LOGS:-$HOME/runs}
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
-export OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=$GPU
-# The team project, as in run_vit_tiny_baseline.sh (a .env or the environment may override it).
-export WANDB_ENTITY=${WANDB_ENTITY:-IdlF26Group40} WANDB_PROJECT=${WANDB_PROJECT:-ViT-perforated}
-python=${PYTHON:-$REPO/.venv/bin/python}
+cd "$REPO"
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
 
@@ -95,7 +102,7 @@ for K in $SCALES; do
          "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $(git log --oneline -1)"
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
     # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
-    if ! "$python" -u main.py "$DATA" \
+    if ! "$PYTHON" -u main.py "$DATA" \
         --gpu 0 --train-fraction 0.2 --subset-seed 42 \
         --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
