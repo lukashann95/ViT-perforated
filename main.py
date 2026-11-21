@@ -6,6 +6,7 @@ import math
 import os
 import random
 import shutil
+import tempfile
 import time
 import warnings
 from datetime import datetime
@@ -154,7 +155,7 @@ parser.add_argument('--name', default=None, type=str,
 parser.add_argument("--report-to", default='', type=str,
                     help="Options are ['wandb']")
 parser.add_argument("--wandb-history-from", default='', type=str, metavar='RUN_ID',
-                    help="W&B run (same entity/project) whose logged scalars up to the resume step "
+                    help="W&B run (same entity/project) whose logged scalars and images up to the resume step "
                          "are copied into this run first, e.g. the run a --pai-resume checkpoint "
                          "came from. W&B's own run forking is a private preview feature.")
 parser.add_argument("--wandb-name", default='', type=str, metavar='RUN_ID',
@@ -166,25 +167,51 @@ pai_setup.add_arguments(parser)
 best_acc1 = 0
 
 
-def copy_wandb_history(run_id, last_step):
-    """Copy the scalars run_id logged up to last_step into the current W&B run.
+def copy_wandb_history(run_id, last_step, steps_per_epoch):
+    """Copy what run_id logged up to last_step into the current W&B run.
 
     Stands in for W&B run forking, which is a private preview feature: charts of a resumed run
-    then start at step 0. Media (e.g. PAI plots) are not copied; PAI's own plots already
-    include the restored history.
+    then start at step 0. Scalars are copied directly; images (e.g. PAI plots) are downloaded from
+    the source run and logged again at their original steps. Rows without an epoch (runs from
+    before it was logged) get one from this run's steps_per_epoch, which assumes the source run
+    used the same batch size.
     """
     source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{wandb.run.project}/{run_id}")
-    rows = 0
-    for row in source.scan_history(page_size=1000):
-        step = row.get('_step')
-        if step is None or step > last_step:
-            continue
-        data = {k: v for k, v in row.items()
-                if not k.startswith('_') and v is not None and not isinstance(v, dict)}
-        if data:
-            wandb.log(data, step=step)
-            rows += 1
-    print(f"=> copied {rows} W&B history rows (steps <= {last_step}) from run '{run_id}'")
+    rows = images = 0
+    with tempfile.TemporaryDirectory() as media_dir:
+        for row in source.scan_history(page_size=1000):
+            step = row.get('_step')
+            if step is None or step > last_step:
+                continue
+            data = {}
+            for key, value in row.items():
+                if key.startswith('_') or value is None:
+                    continue
+                if not isinstance(value, dict):
+                    data[key] = value
+                elif value.get('_type') == 'image-file' and value.get('path'):
+                    image = copy_wandb_image(source, value, media_dir)
+                    if image is not None:
+                        data[key] = image
+                        images += 1
+            if data:
+                data.setdefault('epoch', step / steps_per_epoch)
+                wandb.log(data, step=step)
+                rows += 1
+    print(f"=> copied {rows} W&B history rows with {images} images (steps <= {last_step}) "
+          f"from run '{run_id}'")
+
+
+def copy_wandb_image(source, entry, media_dir):
+    """Download one logged image of the source run; returns a wandb.Image, or None on failure."""
+    try:
+        source.file(entry['path']).download(root=media_dir, replace=True)
+        # wandb.log copies the file into this run's media directory, so media_dir may go after.
+        return wandb.Image(os.path.join(media_dir, entry['path']), caption=entry.get('caption'))
+    except Exception as exc:
+        # A missing plot must not abort the training job.
+        warnings.warn(f"Could not copy W&B image {entry['path']}: {exc}")
+        return None
 
 
 def normalize(images):
@@ -488,6 +515,8 @@ def main_worker(gpu, args):
 
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.total_batch_size)
+    # Logged as 'epoch' with every W&B entry, so runs with different batch sizes line up.
+    args.steps_per_epoch = n / args.total_batch_size
     args.specified_steps = {round(n * epoch / args.total_batch_size) for epoch in args.log_epoch}
     args.specified_steps.add(total_steps)
 
@@ -504,10 +533,12 @@ def main_worker(gpu, args):
         drop_last=True, multiprocessing_context='spawn',
         prefetch_factor=1, persistent_workers=True)
 
+    # Persistent: spawned workers re-import main.py, torch and PAI, which took ~110 s per
+    # validation on Delta (~40 s on riddle). With one validation per epoch that was ~28% of runtime.
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.prefetch_factor * args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler,
-        multiprocessing_context='spawn', prefetch_factor=1)
+        multiprocessing_context='spawn', prefetch_factor=1, persistent_workers=True)
 
     if not args.pai:
         scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
@@ -552,10 +583,14 @@ def main_worker(gpu, args):
             resume='auto',
             config=vars(args),
         )
+        # Plot everything against epochs (step / steps per epoch) by default; _step stays available.
+        wandb.define_metric('epoch')
+        for name in ('train/*', 'val/*', 'pai/*', 'lr', 'l2_*', 'data_time', 'batch_time', 'samples_*'):
+            wandb.define_metric(name, step_metric='epoch')
         params_file = os.path.join(args.logs, args.name, "params.txt")
         wandb.save(params_file)
         if args.wandb_history_from and args.start_step:
-            copy_wandb_history(args.wandb_history_from, args.start_step)
+            copy_wandb_history(args.wandb_history_from, args.start_step, args.steps_per_epoch)
 
     # PAI replaces modules when it adds dendrites, so PAI runs stay uncompiled.
     if not args.pai:
@@ -635,7 +670,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             optimizer, scheduler = pai_setup.setup_optimizer(model, args)
         image_data = pai_images.collect(start_step, wandb if args.wandb and is_primary(args) else None)
         if args.wandb and is_primary(args):
-            wandb.log({**pai_setup.stats(), **image_data}, step=start_step)
+            wandb.log({**pai_setup.stats(), **image_data, 'epoch': start_step / args.steps_per_epoch},
+                      step=start_step)
 
     # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
     # the source run's best model (which PAI reloads at a switch) after its first step.
@@ -651,6 +687,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         step_correct = 0.0
         # The phase only changes at validations, so it is fixed for the whole step.
         dendrite_phase = args.pai and pai_setup.in_dendrite_phase()
+        # Neuron phases accumulate the --accum-freq microbatches into one optimizer step (exact).
+        # Dendrite phases step after every microbatch instead: Perforated Backpropagation trains
+        # candidates inside optimizer.step() from what each forward pass recorded, so
+        # accumulating would not equal one large batch. Candidates then train on microbatches.
+        dendrite_skipped = 0
 
         for img, trt1, trt2 in chunk(args.accum_freq, device, images, target1, target2):
             # compute output
@@ -669,7 +710,19 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             if dendrite_phase:
                 # PAI's documented AMP pattern: a plain, unscaled backward in dendrite ('p')
                 # phases. PAI's dendrite correlation learning is not invariant to the loss scale.
-                (loss / args.accum_freq).backward()
+                # Each microbatch is its own optimizer step, so its loss is not divided.
+                loss.backward()
+                # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
+                # during the (unscaled) backward, so GradScaler is bypassed as PAI documents.
+                # Without loss scaling fp16 should not overflow; if it ever does, skip the update
+                # rather than let a non-finite error signal turn the candidate weights into NaN.
+                if pai_setup.dendrite_grads_overflowed():
+                    dendrite_skipped += 1
+                    pai_setup.DIAG['last_scale_drop_step'] = step
+                    print(f"=> non-finite gradient in dendrite step {step}: skipped the update")
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
             else:
                 scaler.scale(loss / args.accum_freq).backward()
 
@@ -680,18 +733,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         interval_samples += images.size(0)
 
         if dendrite_phase:
-            # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
-            # during the (unscaled) backward, so GradScaler is bypassed as PAI documents. Without
-            # loss scaling fp16 should not overflow; if it ever does, skip the update rather
-            # than let a non-finite error signal turn the candidate dendrite weights into NaN.
+            # The optimizer already stepped once per microbatch above.
             l2_grads = torch.zeros((), device=device)
-            if pai_setup.dendrite_grads_overflowed():
-                optimizer_updated = False
-                pai_setup.DIAG['last_scale_drop_step'] = step
-                print(f"=> non-finite gradient in dendrite step {step}: skipped the update")
-            else:
-                optimizer.step()
-                optimizer_updated = True
+            optimizer_updated = dendrite_skipped == 0
         else:
             # Unscale only after all microbatches have accumulated, before clipping.
             scaler.unscale_(optimizer)
@@ -744,7 +788,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "samples_per_second_per_gpu": samples_per_second_per_gpu,
                     "lr": optimizer.param_groups[0]['lr'],
                     "l2_grads": l2_grads.item(),
-                    "l2_params": math.sqrt(l2_params)
+                    "l2_params": math.sqrt(l2_params),
+                    "epoch": step / args.steps_per_epoch,
                 }
                 # Keep this step open for validation, PAI stats and plots.
                 pai_validation = args.pai and (step % args.log_steps == 0 or step in args.specified_steps)
@@ -778,7 +823,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     optimizer, scheduler = pai_setup.setup_optimizer(model, args)
                 image_data = pai_images.collect(step, wandb if args.wandb and is_primary(args) else None)
                 if args.wandb and is_primary(args):
-                    wandb.log({**pai_setup.stats(), **image_data}, step=step)
+                    wandb.log({**pai_setup.stats(), **image_data, 'epoch': step / args.steps_per_epoch},
+                              step=step)
 
             if is_primary(args):
                 ckpt = {
@@ -860,6 +906,7 @@ def validate(val_loader, model, step, device, args):
             'val/loss': losses.avg,
             'val/acc@1': top1.avg,
             'val/acc@5': top5.avg,
+            'epoch': step / args.steps_per_epoch,
         }
         # PAI adds stats and images to the same step immediately after validation.
         wandb.log(log_data, step=step, commit=not (args.pai and not args.evaluate))
