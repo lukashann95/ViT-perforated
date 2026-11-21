@@ -526,6 +526,10 @@ def perforate(model, args):
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
     pc.set_p_epochs_to_switch(args.pai_p_epochs_to_switch)
+    if args.pai_schedule == 'cosine':
+        # PAI's default LR search after structural changes (find_best_lr) would override the
+        # cosine's LRs; PAI also says it only suits step-based schedulers.
+        pc.set_find_best_lr(False)
     if getattr(args, 'pai_fixed_switch', None):
         pc.set_switch_mode(pc.DOING_FIXED_SWITCH)
         pc.set_n_fixed_switch_num(args.pai_fixed_switch)
@@ -575,9 +579,6 @@ def setup_optimizer(model, args):
     groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
     lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
-    if in_dendrite_phase():
-        print(f"=> dendrite-phase optimizer: LR {lr:.3g} (--lr {args.lr:.3g}, --pai-p-lr-scaling "
-              f"{args.pai_p_lr_scaling}, --accum-freq {args.accum_freq})")
     opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': args.weight_decay}
     if args.pai_schedule == 'cosine':
@@ -587,7 +588,14 @@ def setup_optimizer(model, args):
     else:
         GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
         sched_args = {'mode': 'max', 'patience': args.pai_patience}
-    return GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
+    optimizer, scheduler = GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
+    # PAI adds dendrite parameters to the groups itself; log what each group ends up with.
+    phase = 'dendrite' if in_dendrite_phase() else 'neuron'
+    print(f"=> {phase}-phase optimizer (--lr {args.lr:.3g}, --pai-p-lr-scaling {args.pai_p_lr_scaling}, "
+          f"--accum-freq {args.accum_freq}): " + "; ".join(
+              f"group {i}: {sum(p.numel() for p in g['params'])} params, lr {g['lr']:.3g}, "
+              f"weight_decay {g['weight_decay']:.3g}" for i, g in enumerate(optimizer.param_groups)))
+    return optimizer, scheduler
 
 
 def p_lr_factor(args):
