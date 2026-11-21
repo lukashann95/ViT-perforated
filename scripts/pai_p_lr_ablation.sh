@@ -17,7 +17,8 @@
 #   256, sqrt LR scaling:        PEAK_LR=5e-4   BATCH=256
 # Env: CKPT, PEAK_LR, BATCH (required); ACCUM (default 1); SCALES (default "0.01 0.1 1 10 100");
 # P_EPOCHS (default 25); LAYER (default 11); DATA (ImageFolder root, default ~/data/imagenet);
-# LOGS (default ~/runs); GPU (default 0); WORKERS (default 14); WANDB=0 to skip W&B.
+# LOGS (default ~/runs); GPU (default 0); WORKERS (default 14); WANDB=0 to skip W&B;
+# WANDB_ENTITY / WANDB_PROJECT (default IdlF26Group40 / ViT-perforated).
 # Needs PAIEMAIL/PAITOKEN (environment, ~/.pai_env or the repo's .env); W&B reads
 # WANDB_API_TOKEN from .env.
 set -euo pipefail
@@ -41,6 +42,8 @@ if [ -f .env ]; then set -a; source .env; set +a; fi
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
 export OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=$GPU
+# The team project, as in run_vit_tiny_baseline.sh (a .env or the environment may override it).
+export WANDB_ENTITY=${WANDB_ENTITY:-IdlF26Group40} WANDB_PROJECT=${WANDB_PROJECT:-ViT-perforated}
 python=${PYTHON:-$REPO/.venv/bin/python}
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
