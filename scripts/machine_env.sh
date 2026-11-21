@@ -70,8 +70,13 @@ if [ -z "${DATA:-}" ] && [ "$ON_DELTA" = 1 ]; then
     trap 'rm -rf "$DATA"' EXIT
     echo "Unpacking ImageNet to $DATA ($avail_gb GB free)..."
     start=$SECONDS
-    # pyarrow lives in a small separate venv so the training lockfile stays unchanged.
-    "${DATA_VENV:-$DELTA_PROJECT/.venv-data}/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" \
+    # pyarrow lives in a small separate venv so the training lockfile stays unchanged: the one
+    # delta_pai_resume.sbatch uses, else setup_machine.sh's default.
+    if [ -z "${DATA_VENV:-}" ]; then
+        DATA_VENV=$DELTA_PROJECT/.venv-data
+        [ -x "$DATA_VENV/bin/python" ] || DATA_VENV=$REPO/.venv-data
+    fi
+    "$DATA_VENV/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" \
         /projects/bjto/shared/imagenet_1k_resized_256/data "$DATA" --workers "$SLURM_CPUS_PER_TASK"
     echo "Unpacked in $((SECONDS - start)) s"
 fi
