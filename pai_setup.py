@@ -188,7 +188,15 @@ def add_arguments(parser):
                        help="training batches before PAI scores dendrites (PAI default 100); "
                             "must be below --log-steps")
     group.add_argument('--pai-patience', default=2, type=int,
-                       help='ReduceLROnPlateau patience, in validations')
+                       help='ReduceLROnPlateau patience, in validations (--pai-schedule plateau)')
+    group.add_argument('--pai-schedule', default='plateau', choices=['plateau', 'cosine'],
+                       help='LR scheduler PAI builds for every phase: ReduceLROnPlateau, or '
+                            'CosineAnnealingLR from the phase\'s starting LR to 0 over '
+                            '--pai-cosine-epochs validations. PAI rebuilds and steps it (once per '
+                            'validation), as in PAI\'s ResNet example; each phase restarts it.')
+    group.add_argument('--pai-cosine-epochs', default=None, type=int, metavar='N',
+                       help='T_max of --pai-schedule cosine, in validations (one per epoch with '
+                            '--log-steps = steps per epoch)')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
 
@@ -205,6 +213,14 @@ def check_args(parser, args):
         parser.error('--pai-warmup must be non-negative')
     if args.pai_fixed_switch is not None and args.pai_fixed_switch < 1:
         parser.error('--pai-fixed-switch must be at least 1')
+    if args.pai_schedule == 'cosine':
+        if not args.pai_cosine_epochs or args.pai_cosine_epochs < 1:
+            parser.error('--pai-schedule cosine needs --pai-cosine-epochs >= 1')
+        if args.pai_warmup:
+            # warmup_lr overwrites the LR, and CosineAnnealingLR computes each LR from the last.
+            parser.error('--pai-warmup is not supported with --pai-schedule cosine')
+    elif args.pai_cosine_epochs is not None:
+        parser.error('--pai-cosine-epochs applies only to --pai-schedule cosine')
     if args.pai_resume and args.pai_init:
         parser.error('--pai-resume and --pai-init are mutually exclusive')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
@@ -548,9 +564,10 @@ def decays(name, param):
 
 def setup_optimizer(model, args):
     # PAI builds the optimizer itself so it can swap to dendrite-only parameters in dendrite
-    # phases. PAI steps the scheduler from validation scores; main.py must not step it.
+    # phases, and builds and steps the scheduler (from validation scores for ReduceLROnPlateau,
+    # once per validation for CosineAnnealingLR); main.py must not step it. Called again after
+    # every restructure, so each phase gets a fresh scheduler starting at its full LR.
     GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
-    GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
     # Weight decay on weight matrices only, as main.py's baseline optimizer does: biases,
     # LayerNorm gains and the like get none. PAI keeps parameter groups (minus parameters that
     # do not require grad in the current phase), so this holds in every phase, dendrites included.
@@ -559,7 +576,13 @@ def setup_optimizer(model, args):
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
     opt_args = {'params': groups, 'lr': args.lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': args.weight_decay}
-    sched_args = {'mode': 'max', 'patience': args.pai_patience}
+    if args.pai_schedule == 'cosine':
+        # Decays to 0 like main.py's baseline cosine (eta_min 0), but per validation, not per step.
+        GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.CosineAnnealingLR)
+        sched_args = {'T_max': args.pai_cosine_epochs, 'eta_min': 0.0}
+    else:
+        GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
+        sched_args = {'mode': 'max', 'patience': args.pai_patience}
     return GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
 
 
