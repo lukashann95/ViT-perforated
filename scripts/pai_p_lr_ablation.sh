@@ -7,9 +7,12 @@
 # As one task-spooler job on riddle GPU 1:
 #   forgeq-gpu 1 -L plr env GPU=1 CKPT=... PEAK_LR=2.5e-4 BATCH=256 ~/ViT-perforated/scripts/pai_p_lr_ablation.sh
 #
-# PEAK_LR is the neuron run's peak LR (the start of its cosine). The four setups:
+# PEAK_LR is the neuron run's peak LR (the start of its cosine), for its effective batch BATCH.
+# With ACCUM=k the p phase steps once per BATCH/k microbatch, and --pai-p-lr-scaling linear
+# trains the candidates at K x PEAK_LR / k. The four setups:
 #   1024 in one pass:            PEAK_LR=1e-3   BATCH=1024
-#   1024 neurons, 256 dendrites: PEAK_LR=1e-3   BATCH=1024 ACCUM=4  (p phase steps per 256 microbatch)
+#   1024 neurons, 256 dendrites: PEAK_LR=1e-3   BATCH=1024 ACCUM=4  (candidates at K x 2.5e-4, as
+#                                                                    the linear-scaled 256 setup)
 #   256, linear LR scaling:      PEAK_LR=2.5e-4 BATCH=256
 #   256, sqrt LR scaling:        PEAK_LR=5e-4   BATCH=256
 # Env: CKPT, PEAK_LR, BATCH (required); ACCUM (default 1); SCALES (default "0.01 0.1 1 10 100");
@@ -53,8 +56,8 @@ for K in $SCALES; do
     RUN_NAME=vit_tiny_pai_plr_l${LAYER}_b${BATCH}_acc${ACCUM}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
-    echo "=== $RUN_NAME: LR $LR ($K x $PEAK_LR) -> 0 over $P_EPOCHS epochs, from $CKPT," \
-         "commit $(git log --oneline -1)"
+    echo "=== $RUN_NAME: LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
+         "over $P_EPOCHS epochs, from $CKPT, commit $(git log --oneline -1)"
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
     # With --pai-fixed-switch the p phase lasts exactly --pai-p-epochs-to-switch validations.
     # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
@@ -65,7 +68,7 @@ for K in $SCALES; do
         --epochs "$P_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
         --lr "$LR" --wd 0 --workers "$WORKERS" \
         --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target ln_mlp --max-dendrites 1 \
-        --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" \
+        --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
         --pai-fixed-switch 1000 --pai-p-epochs-to-switch "$P_EPOCHS" \
         --wandb-notes "p-phase LR ablation from $CKPT, K=$K, peak LR $PEAK_LR" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
