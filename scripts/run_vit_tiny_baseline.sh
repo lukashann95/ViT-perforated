@@ -24,6 +24,8 @@
 #   GPU         which GPU to use                  (default: 0)
 #   WORKERS     data-loading workers              (default: CPU cores - 1)
 #   RUN_NAME    run / W&B name; reuse it with --resume to continue a run
+#   WANDB_CKPT  1 uploads checkpoints to W&B as model artifact checkpoint-<RUN_NAME>, keeping the
+#               'last' (every validation) and 'best' versions; 0 turns it off (default: 1)
 #
 # Warmup is 2000 steps at batch 1024 and scaled to cover the same epochs at other batch sizes.
 # --wd is 1e-4 x BATCH/1024 whatever SCALING is: main.py's AdamW coefficient is --wd/--lr, so
@@ -79,6 +81,9 @@ test -f .env              || { echo "No $REPO/.env with WANDB_API_TOKEN"; exit 1
 grep -q "pai_validation = (step %" main.py \
     || { echo "main.py: missing the W&B validation logging fix"; exit 1; }
 
+CKPT_ARGS=()
+if [ "${WANDB_CKPT:-1}" = 1 ]; then CKPT_ARGS=(--wandb-checkpoints); fi
+
 export WANDB_DIR="$LOG_ROOT/$RUN_NAME"
 mkdir -p "$WANDB_DIR"
 export WANDB_ENTITY="IdlF26Group40"
@@ -110,4 +115,5 @@ uv run python -u main.py "$IMAGENET" \
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
     --report-to wandb \
+    "${CKPT_ARGS[@]}" \
     "$@" 2>&1 | tee -a "$LOG_ROOT/$RUN_NAME/train.log"

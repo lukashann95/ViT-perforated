@@ -432,6 +432,12 @@ def write_best_model(model, args):
           f"(score {float(tracker_value(string, 'current_best_validation_score')):.3f})")
 
 
+def before_first_switch():
+    """True while PAI is still in its first neuron phase: mode 'n' and no dendrites added yet."""
+    member_vars = GPA.pai_tracker.member_vars
+    return member_vars.get('mode') == 'n' and not member_vars.get('num_dendrites_added', 0)
+
+
 def archive_pre_switch(args):
     """Keep the run's latest pre-switch state in <run>/archive/pre_switch/, for --pai-resume.
 
@@ -440,8 +446,7 @@ def archive_pre_switch(args):
     PAI reloads at a switch) into the archive; from the first switch on, leave it alone, so it
     holds the last neuron-only state. Both files are replaced atomically.
     """
-    member_vars = GPA.pai_tracker.member_vars
-    if member_vars.get('mode') != 'n' or member_vars.get('num_dendrites_added', 0):
+    if not before_first_switch():
         return
     dest = os.path.join(args.log_dir, 'archive', 'pre_switch')
     os.makedirs(os.path.join(dest, 'pai'), exist_ok=True)

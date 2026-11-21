@@ -165,6 +165,11 @@ parser.add_argument("--wandb-name", default='', type=str, metavar='RUN_ID',
                          "--wandb-history-from, continues a run's log directory under a new W&B run.")
 parser.add_argument("--wandb-notes", default='', type=str,
                     help="Notes if logging with wandb")
+parser.add_argument("--wandb-checkpoints", action='store_true',
+                    help="upload checkpoints to W&B as model artifact checkpoint-<--name>, three "
+                         "kept: 'last' (every validation), 'best' (best acc@1) and, for PAI runs, "
+                         "'pre_switch' (the last state before the first switch to dendrites, "
+                         "for --pai-resume); versions left without an alias are deleted")
 pai_setup.add_arguments(parser)
 best_acc1 = 0
 
@@ -606,6 +611,8 @@ def main_worker(gpu, args):
         validate(val_loader, model, args.start_step, device, args)
     else:
         train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args)
+        if args.wandb and args.wandb_checkpoints and is_primary(args):
+            finish_checkpoint_uploads(args)
 
     if args.distributed or args.ngpus_per_node > 1:
         dist.destroy_process_group()
@@ -818,6 +825,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
             training_complete = False
             if args.pai:
+                was_before_first_switch = pai_setup.before_first_switch()
                 model, restructured, training_complete = pai_setup.add_score(model, acc1, args, device)
                 original_model = model
                 model.train()
@@ -841,6 +849,13 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 save_checkpoint(ckpt, is_best, args.checkpoint_path, step=step if step in args.specified_steps else None)
                 if args.pai:
                     pai_setup.archive_pre_switch(args)
+                if args.wandb and args.wandb_checkpoints:
+                    # The first switch happened at this validation: archive/pre_switch/ now holds
+                    # the last neuron-only state for good. Uploaded before 'last' moves on, while
+                    # the version with the same files still has 'last' and cannot be pruned.
+                    if args.pai and was_before_first_switch and not pai_setup.before_first_switch():
+                        upload_pre_switch(args)
+                    upload_checkpoint(args, step, acc1, is_best)
 
             if training_complete:
                 print(f"=> PAI reports training complete at step {step}")
@@ -924,6 +939,87 @@ def save_checkpoint(state, is_best, path, filename='checkpoint.pth.tar', step=No
         shutil.copyfile(filename, os.path.join(path, 'model_best.pth.tar'))
     if step is not None:
         shutil.copyfile(filename, os.path.join(path, f'model_step_{step}.pth.tar'))
+
+
+# --wandb-checkpoints: one W&B model artifact per run, checkpoint-<--name> (so a --resume
+# continuation under a new W&B run keeps adding to it), each version holding checkpoint.pth.tar and,
+# for PAI runs, pai/best_model.pt (PAI reloads it at a switch, so a resume needs both). Aliases:
+#   last        every validation's checkpoint
+#   best        the checkpoint with the best acc@1 so far (one version may be both last and best)
+#   pre_switch  PAI runs: the last checkpoint before the first switch to dendrites, for --pai-resume
+# W&B moves an alias to the newest version that has it; versions left without an alias are deleted,
+# so a run keeps at most three. Uploads run in the background; errors never stop training.
+_last_checkpoint_upload = None
+
+
+def upload_checkpoint(args, step, acc1, is_best):
+    """Upload this validation's checkpoint as 'last' (and 'best' when is_best)."""
+    try:
+        _log_checkpoint(args, os.path.join(args.checkpoint_path, 'checkpoint.pth.tar'),
+                        os.path.join(args.log_dir, 'pai', 'best_model.pt') if args.pai else None,
+                        ['last', 'best'] if is_best else ['last'],
+                        {'step': step, 'epoch': step / args.steps_per_epoch, 'acc1': acc1, 'best_acc1': best_acc1})
+        # The upload above is still running, so its predecessor keeps 'last' until a later prune.
+        prune_checkpoints(args)
+    except Exception as e:
+        print(f"=> W&B checkpoint upload failed (training continues): {e}")
+
+
+def upload_pre_switch(args):
+    """Upload <run>/archive/pre_switch/ (pai_setup.archive_pre_switch) as 'pre_switch'."""
+    folder = os.path.join(args.log_dir, 'archive', 'pre_switch')
+    ckpt = os.path.join(folder, 'checkpoint.pth.tar')
+    pai_best = os.path.join(folder, 'pai', 'best_model.pt')
+    if not (os.path.isfile(ckpt) and os.path.isfile(pai_best)):
+        print(f"=> nothing to upload from {folder} (PAI switched at this run's first validation)")
+        return
+    try:
+        step = torch.load(ckpt, map_location='cpu', weights_only=True)['step']
+        _log_checkpoint(args, ckpt, pai_best, ['pre_switch'],
+                        {'step': step, 'epoch': step / args.steps_per_epoch,
+                         'pai_layers': args.pai_layers, 'pai_target': args.pai_target})
+    except Exception as e:
+        print(f"=> W&B pre-switch checkpoint upload failed (training continues): {e}")
+
+
+def _log_checkpoint(args, ckpt_file, pai_file, aliases, metadata):
+    global _last_checkpoint_upload
+    name = f'checkpoint-{args.name}'
+    artifact = wandb.Artifact(name, type='model', metadata=metadata)
+    # The default 'mutable' policy stages a copy, so the next save cannot change the upload.
+    artifact.add_file(ckpt_file, name='checkpoint.pth.tar')
+    if pai_file and os.path.exists(pai_file):
+        artifact.add_file(pai_file, name='pai/best_model.pt')
+    _last_checkpoint_upload = wandb.log_artifact(artifact, aliases=aliases)
+    print(f"=> uploading checkpoint (step {metadata['step']}) to W&B as {name}:{','.join(aliases)}")
+
+
+def prune_checkpoints(args):
+    """Delete the versions of checkpoint-<--name> that no longer have an alias."""
+    if os.environ.get('WANDB_MODE', 'online') in ('offline', 'disabled'):
+        return
+    try:
+        api = wandb.Api(timeout=60)
+        for old in api.artifacts('model', f'{wandb.run.entity}/{wandb.run.project}/checkpoint-{args.name}'):
+            if old.state == 'COMMITTED' and not old.aliases:
+                old.delete()
+    except Exception as e:
+        # Before the first upload commits, the collection does not exist yet.
+        if 'not found' not in str(e).lower():
+            print(f"=> W&B checkpoint cleanup failed (training continues): {e}")
+
+
+def finish_checkpoint_uploads(args):
+    """At the end of training: wait for the last upload, then delete the versions it replaced."""
+    # Offline runs upload at `wandb sync`, and W&B cannot wait on an artifact before that.
+    if _last_checkpoint_upload is None or os.environ.get('WANDB_MODE', 'online') in ('offline', 'disabled'):
+        return
+    try:
+        print("=> waiting for the last W&B checkpoint upload...")
+        _last_checkpoint_upload.wait()
+        prune_checkpoints(args)
+    except Exception as e:
+        print(f"=> W&B checkpoint upload failed: {e}")
 
 class Summary(Enum):
     NONE = 0
