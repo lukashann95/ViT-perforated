@@ -1,7 +1,7 @@
 #!/bin/bash
 # Baseline benchmark: ViT-Tiny/16 (no PAI), 20% stratified ImageNet-1k subset,
 # FP32 with TF32 tensor-core matmuls/convs (--tf32; no effect on GPUs without TF32, e.g. V100),
-# single GPU. Effective batch 1024, split into microbatches to fit in memory.
+# single GPU. Effective batch BATCH (default 1024), split into microbatches to fit in memory.
 #
 # Setup (once):
 #   - Repo checked out on the branch with the W&B validation logging fix in main.py (the script
@@ -18,15 +18,19 @@
 #   EPOCHS      training epochs                   (default: 90)
 #   LOG_EPOCHS  extra checkpoint/validation epochs(default: "30 60")
 #   BATCH       effective batch size              (default: 1024)
-#   SCALING     how LR/WD follow BATCH from the 1024 baseline (LR 1e-3, WD 1e-4):
-#               none (keep them), linear (x BATCH/1024) or sqrt (x sqrt(BATCH/1024)) (default: none)
+#   SCALING     how LR follows BATCH from the 1024 baseline (LR 1e-3):
+#               none (keep it), linear (x BATCH/1024) or sqrt (x sqrt(BATCH/1024)) (default: none)
 #   ACCUM       microbatches per step; 4 = 4x256. Use 8 (8x128) if you hit CUDA OOM. (default: BATCH/256)
 #   GPU         which GPU to use                  (default: 0)
 #   WORKERS     data-loading workers              (default: CPU cores - 1)
 #   RUN_NAME    run / W&B name; reuse it with --resume to continue a run
 #
 # Warmup is 2000 steps at batch 1024 and scaled to cover the same epochs at other batch sizes.
-# Batch-256 runs with linear and sqrt LR/WD scaling (run names get _b256_linear / _b256_sqrt):
+# --wd is 1e-4 x BATCH/1024 whatever SCALING is: main.py's AdamW coefficient is --wd/--lr, so
+# each step decays the weights by --wd (times the LR schedule's fraction of its peak), and this
+# keeps the decay per epoch of the 1024 baseline. Scaling it with the LR would give the sqrt arm
+# twice the baseline's decay per epoch.
+# Batch-256 runs with linear and sqrt LR scaling (run names get _b256_linear / _b256_sqrt):
 #   BATCH=256 SCALING=linear ./scripts/run_vit_tiny_baseline.sh
 #   BATCH=256 SCALING=sqrt ./scripts/run_vit_tiny_baseline.sh
 #
@@ -48,7 +52,7 @@ case "$SCALING" in
     *) echo "SCALING must be none, linear or sqrt"; exit 1 ;;
 esac
 LR=$(awk "BEGIN { printf \"%g\", 1e-3 * $SCALE }")
-WD=$(awk "BEGIN { printf \"%g\", 1e-4 * $SCALE }")
+WD=$(awk "BEGIN { printf \"%g\", 1e-4 * $BATCH / 1024 }")
 WARMUP=$(( 2000 * 1024 / BATCH ))
 # Name tag only for non-default batch sizes, so batch-1024 run names stay as before.
 TAG=
