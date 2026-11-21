@@ -36,9 +36,11 @@ from transforms import TwoHotMixUp, TFInceptionCrop, RandAugment17
 
 
 # "(...)/python3.10/site-packages/torch/_inductor/compile_fx.py:140: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance."
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('highest')
+# Strict FP32 by default (no TF32 in matmuls or cuDNN convs); pass --tf32 to allow TF32.
+torch.backends.cudnn.allow_tf32 = False
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser =argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('--train-fraction', default=1.0, type=float,
@@ -791,8 +793,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "l2_params": math.sqrt(l2_params),
                     "epoch": step / args.steps_per_epoch,
                 }
-                # Keep this step open for validation, PAI stats and plots.
-                pai_validation = args.pai and (step % args.log_steps == 0 or step in args.specified_steps)
+                # Keep this step open so validation (and PAI stats/plots) land on the same W&B step;
+                # committing here would make W&B drop the later val/* log for this step.
+                pai_validation = (step % args.log_steps == 0 or step in args.specified_steps)
                 wandb.log(log_data, step=step, commit=not pai_validation)
             interval_correct = 0.0
             interval_loss_sum = 0.0
