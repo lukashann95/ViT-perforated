@@ -10,6 +10,7 @@ PAI writes its graphs, CSVs and model saves to ./pai, so main.py changes into th
 log directory before calling perforate().
 """
 import json
+import math
 import os
 import pdb
 import re
@@ -194,6 +195,10 @@ def add_arguments(parser):
                             'CosineAnnealingLR from the phase\'s starting LR to 0 over '
                             '--pai-cosine-epochs validations. PAI rebuilds and steps it (once per '
                             'validation), as in PAI\'s ResNet example; each phase restarts it.')
+    group.add_argument('--pai-p-lr-scaling', default='none', choices=['none', 'linear', 'sqrt'],
+                       help='with --accum-freq k, dendrite (p) phases step once per microbatch of '
+                            'batch/k, so scale their LR by 1/k (linear) or 1/sqrt(k) (sqrt). '
+                            'none keeps --lr, as PAI runs did before this option.')
     group.add_argument('--pai-cosine-epochs', default=None, type=int, metavar='N',
                        help='T_max of --pai-schedule cosine, in validations (one per epoch with '
                             '--log-steps = steps per epoch)')
@@ -569,7 +574,11 @@ def setup_optimizer(model, args):
     named = list(model.named_parameters())
     groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
-    opt_args = {'params': groups, 'lr': args.lr, 'betas': (args.beta1, args.beta2),
+    lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
+    if in_dendrite_phase():
+        print(f"=> dendrite-phase optimizer: LR {lr:.3g} (--lr {args.lr:.3g}, --pai-p-lr-scaling "
+              f"{args.pai_p_lr_scaling}, --accum-freq {args.accum_freq})")
+    opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': args.weight_decay}
     if args.pai_schedule == 'cosine':
         # Decays to 0 like main.py's baseline cosine (eta_min 0), but per validation, not per step.
@@ -579,6 +588,15 @@ def setup_optimizer(model, args):
         GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
         sched_args = {'mode': 'max', 'patience': args.pai_patience}
     return GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
+
+
+def p_lr_factor(args):
+    """LR factor for dendrite phases, where each microbatch (batch / accum_freq) is a step."""
+    if args.pai_p_lr_scaling == 'linear':
+        return 1 / args.accum_freq
+    if args.pai_p_lr_scaling == 'sqrt':
+        return 1 / math.sqrt(args.accum_freq)
+    return 1.0
 
 
 def add_score(model, acc1, args, device, force_switch=False):
