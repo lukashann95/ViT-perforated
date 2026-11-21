@@ -17,10 +17,18 @@
 #   IMAGENET    dataset path with train/ and val/ (default: $HOME/data/imagenet)
 #   EPOCHS      training epochs                   (default: 90)
 #   LOG_EPOCHS  extra checkpoint/validation epochs(default: "30 60")
-#   ACCUM       microbatches per step; 4 = 4x256. Use 8 (8x128) if you hit CUDA OOM. (default: 4)
+#   BATCH       effective batch size              (default: 1024)
+#   SCALING     how LR/WD follow BATCH from the 1024 baseline (LR 1e-3, WD 1e-4):
+#               none (keep them), linear (x BATCH/1024) or sqrt (x sqrt(BATCH/1024)) (default: none)
+#   ACCUM       microbatches per step; 4 = 4x256. Use 8 (8x128) if you hit CUDA OOM. (default: BATCH/256)
 #   GPU         which GPU to use                  (default: 0)
 #   WORKERS     data-loading workers              (default: CPU cores - 1)
 #   RUN_NAME    run / W&B name; reuse it with --resume to continue a run
+#
+# Warmup is 2000 steps at batch 1024 and scaled to cover the same epochs at other batch sizes.
+# Batch-256 runs with linear and sqrt LR/WD scaling (run names get _b256_linear / _b256_sqrt):
+#   BATCH=256 SCALING=linear ./scripts/run_vit_tiny_baseline.sh
+#   BATCH=256 SCALING=sqrt ./scripts/run_vit_tiny_baseline.sh
 #
 # Resume after a crash:
 #   RUN_NAME=<name> ./run_vit_tiny_baseline.sh --resume "<REPO>/logs/<name>/checkpoints/checkpoint.pth.tar"
@@ -30,9 +38,26 @@ REPO="${REPO:-$HOME/Anshu/ViT-perforated}"
 IMAGENET="${IMAGENET:-$HOME/data/imagenet}"
 EPOCHS="${EPOCHS:-90}"
 LOG_EPOCHS="${LOG_EPOCHS:-30 60}"
-ACCUM="${ACCUM:-4}"
+BATCH="${BATCH:-1024}"
+SCALING="${SCALING:-none}"
+ACCUM="${ACCUM:-$(( BATCH > 256 ? BATCH / 256 : 1 ))}"
+case "$SCALING" in
+    none)   SCALE=1 ;;
+    linear) SCALE=$(awk "BEGIN { print $BATCH / 1024 }") ;;
+    sqrt)   SCALE=$(awk "BEGIN { print sqrt($BATCH / 1024) }") ;;
+    *) echo "SCALING must be none, linear or sqrt"; exit 1 ;;
+esac
+LR=$(awk "BEGIN { printf \"%g\", 1e-3 * $SCALE }")
+WD=$(awk "BEGIN { printf \"%g\", 1e-4 * $SCALE }")
+WARMUP=$(( 2000 * 1024 / BATCH ))
+# Name tag only for non-default batch sizes, so batch-1024 run names stay as before.
+TAG=
+if [ "$BATCH" != 1024 ]; then
+    TAG="_b${BATCH}"
+    if [ "$SCALING" != none ]; then TAG="${TAG}_${SCALING}"; fi
+fi
 LOG_ROOT="$REPO/logs"
-RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_20pct_${EPOCHS}ep_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_20pct_${EPOCHS}ep${TAG}_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
 
 # Only show one GPU (with 2+ visible GPUs main.py takes its multi-GPU path and crashes).
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
@@ -55,7 +80,7 @@ mkdir -p "$WANDB_DIR"
 export WANDB_ENTITY="IdlF26Group40"
 export WANDB_PROJECT="ViT-perforated"
 
-echo "Run: $RUN_NAME | GPU: $CUDA_VISIBLE_DEVICES | epochs: $EPOCHS | accum: $ACCUM | workers: $WORKERS"
+echo "Run: $RUN_NAME | GPU: $CUDA_VISIBLE_DEVICES | epochs: $EPOCHS | batch: $BATCH | accum: $ACCUM | lr: $LR | wd: $WD | warmup: $WARMUP | workers: $WORKERS"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # shellcheck disable=SC2086  # LOG_EPOCHS is a space-separated list on purpose
@@ -67,13 +92,15 @@ uv run python -u main.py "$IMAGENET" \
     --num-layers 12 \
     --num-heads 3 \
     --patch-size 16 \
-    --batch-size 1024 \
+    --batch-size "$BATCH" \
     --accum-freq "$ACCUM" \
+    --lr "$LR" \
+    --wd "$WD" \
     --tf32 \
     --mlp-head \
     --torchvision-inception-crop \
     --epochs "$EPOCHS" \
-    --warmup 2000 \
+    --warmup "$WARMUP" \
     --log-epoch $LOG_EPOCHS \
     --workers "$WORKERS" \
     --logs "$LOG_ROOT" \
