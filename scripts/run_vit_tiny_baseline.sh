@@ -1,11 +1,11 @@
 #!/bin/bash
 # Baseline benchmark: ViT-Tiny/16 (no PAI), 20% stratified ImageNet-1k subset,
-# strict FP32, single GPU. Effective batch 1024, split into microbatches to fit in memory.
+# FP32 with TF32 tensor-core matmuls/convs (--tf32; no effect on GPUs without TF32, e.g. V100),
+# single GPU. Effective batch 1024, split into microbatches to fit in memory.
 #
 # Setup (once):
-#   - Repo checked out on the branch with the two main.py edits (the script checks for them):
-#       1. torch.set_float32_matmul_precision('highest') + torch.backends.cudnn.allow_tf32 = False
-#       2. pai_validation = (step % args.log_steps == 0 or step in args.specified_steps)
+#   - Repo checked out on the branch with the W&B validation logging fix in main.py (the script
+#     checks for it): pai_validation = (step % args.log_steps == 0 or step in args.specified_steps)
 #   - Dataset prepared with ./scripts/setup_machine.sh (HF imagenet_1k_resized_256 -> ImageFolder)
 #   - .env in the repo with WANDB_API_TOKEN (W&B account must be in the IdlF26Group40 entity)
 #
@@ -32,7 +32,7 @@ EPOCHS="${EPOCHS:-90}"
 LOG_EPOCHS="${LOG_EPOCHS:-30 60}"
 ACCUM="${ACCUM:-4}"
 LOG_ROOT="$REPO/logs"
-RUN_NAME="${RUN_NAME:-vit_tiny_fp32_1gpu_20pct_${EPOCHS}ep_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_20pct_${EPOCHS}ep_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
 
 # Only show one GPU (with 2+ visible GPUs main.py takes its multi-GPU path and crashes).
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
@@ -46,11 +46,7 @@ test -d "$IMAGENET/val"   || { echo "No $IMAGENET/val"; exit 1; }
 command -v uv >/dev/null  || { echo "uv not found"; exit 1; }
 test -f .env              || { echo "No $REPO/.env with WANDB_API_TOKEN"; exit 1; }
 
-# Fail fast if main.py lacks the benchmark edits (otherwise results/logging differ).
-grep -q "^torch.set_float32_matmul_precision('highest')" main.py \
-    || { echo "main.py: missing set_float32_matmul_precision('highest')"; exit 1; }
-grep -q "^torch.backends.cudnn.allow_tf32 = False" main.py \
-    || { echo "main.py: missing torch.backends.cudnn.allow_tf32 = False"; exit 1; }
+# Fail fast if main.py lacks the W&B fix (otherwise periodic val/* metrics are dropped).
 grep -q "pai_validation = (step %" main.py \
     || { echo "main.py: missing the W&B validation logging fix"; exit 1; }
 
@@ -73,6 +69,7 @@ uv run python -u main.py "$IMAGENET" \
     --patch-size 16 \
     --batch-size 1024 \
     --accum-freq "$ACCUM" \
+    --tf32 \
     --mlp-head \
     --torchvision-inception-crop \
     --epochs "$EPOCHS" \
