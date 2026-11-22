@@ -88,7 +88,10 @@ cd "$REPO"
 if [ -z "${CKPT:-}" ]; then
     CKPT=$LOGS/ckpts/$CKPT_WANDB/checkpoint.pth.tar
     if [ ! -r "$CKPT" ]; then
-        "$PYTHON" - "$CKPT_WANDB" "$(dirname "$CKPT")" <<'PY'
+        # Download next to it and rename, so parallel jobs never read a half-written file.
+        mkdir -p "$(dirname "$CKPT")"
+        TMP_DL=$(mktemp -d "$(dirname "$CKPT")/.download.XXXXXX")
+        "$PYTHON" - "$CKPT_WANDB" "$TMP_DL" <<'PY'
 import os, sys, wandb
 run, dest = sys.argv[1:]
 path = f"{os.environ['WANDB_ENTITY']}/{os.environ['WANDB_PROJECT']}/checkpoint-{run}:last"
@@ -97,6 +100,8 @@ artifact.download(dest)
 print(f"=> downloaded {path} (step {artifact.metadata.get('step')}, "
       f"acc@1 {artifact.metadata.get('acc1')}) to {dest}")
 PY
+        mv -f "$TMP_DL/checkpoint.pth.tar" "$CKPT"
+        rm -rf "$TMP_DL"
     fi
 fi
 test -r "$CKPT" || { echo "cannot read CKPT=$CKPT" >&2; exit 1; }

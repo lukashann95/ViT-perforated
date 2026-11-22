@@ -11,7 +11,7 @@ differs between them.
 | `machine_env.sh` | sourced by both launchers: dataset, workers, Python, credentials, W&B project, GPU |
 | `delta_pai_resume.sbatch` | older Delta-only launcher for plateau-schedule PAI runs (and continuing them after a timeout) |
 | `l40_pai_resume.sbatch` | Vamsi's L40 version of it (any Slurm cluster; setup in its header) |
-| `l40_pai_p_lr_ablation.sbatch` | `pai_p_lr_ablation.sh` as a Slurm job on an L40 / L40S (generic `#SBATCH` lines) |
+| `l40_pai_p_lr_ablation.sbatch` | both LR sweeps (`ln_mlp`, `ln_fc1`) from the 1024 baseline as one Slurm array job on an L40 / L40S |
 | `setup_machine.sh`, `smoke_test.py` | one-time machine setup and its GPU check |
 | `parquet_to_imagefolder.py` | unpacks the parquet shards into `train/<wnid>/`, `val/<wnid>/` |
 | `export_plain_checkpoint.py` | turns a PAI checkpoint into a plain ViT checkpoint |
@@ -103,8 +103,9 @@ squeue -u $USER; tail -f /projects/bjto/lhann/runs/slurm-<job id>.out
 A Slurm cluster run by a friend of Vamsi's. The L40S has 48 GB, so batch 1024 fits in one pass
 (`ACCUM=1`). Set the machine up once with `scripts/setup_machine.sh` on the login node (venvs, keys in
 `.env`, parquet shards in `<repo parent>/imagenet_1k_resized_256/data`), then submit
-`l40_pai_p_lr_ablation.sbatch` (the sweep) or `l40_pai_resume.sbatch` (plateau runs) from the repo root
-with the cluster's partition and account (`-p`, `-A`). Each job unpacks the shards to `$SLURM_TMPDIR`
+`l40_pai_p_lr_ablation.sbatch` (the sweeps) or `l40_pai_resume.sbatch` (plateau runs) from the repo root
+with the cluster's partition and account (`-p`, `-A`). `sbatch -p <partition> -A <account>
+scripts/l40_pai_p_lr_ablation.sbatch` alone runs both batch-1024 sweeps, one array task per target. Each job unpacks the shards to `$SLURM_TMPDIR`
 (or `/tmp`); runs go to `<repo parent>/runs`, the Slurm log to the directory you submitted from.
 
 ## Recipes
@@ -152,9 +153,8 @@ One call runs all five scales k ∈ {0.01, 0.1, 1, 10, 100} one after another. E
 GPU=1 WORKERS=8 CKPT=<checkpoint> PEAK_LR=5e-4 BATCH=256 TARGET=ln_fc1 ./scripts/pai_p_lr_ablation.sh
 # Delta
 sbatch --export=ALL,CKPT=<checkpoint>,PEAK_LR=1e-3,BATCH=1024 scripts/pai_p_lr_ablation.sh
-# L40S
-sbatch -p <partition> -A <account> \
-  --export=ALL,CKPT_WANDB=<run>,PEAK_LR=1e-3,BATCH=1024,TARGET=ln_fc1 scripts/l40_pai_p_lr_ablation.sbatch
+# L40S: both targets from the 1024 baseline (array tasks 0 = ln_mlp, 1 = ln_fc1)
+sbatch -p <partition> -A <account> scripts/l40_pai_p_lr_ablation.sbatch
 ```
 
 Runs are named `vit_tiny_pai_plr_l11_<target>_b<batch>_acc<accum>_lr<peak LR>_k<k>_<time>` (runs before
