@@ -10,6 +10,7 @@ PAI writes its graphs, CSVs and model saves to ./pai, so main.py changes into th
 log directory before calling perforate().
 """
 import json
+import math
 import os
 import pdb
 import re
@@ -188,7 +189,19 @@ def add_arguments(parser):
                        help="training batches before PAI scores dendrites (PAI default 100); "
                             "must be below --log-steps")
     group.add_argument('--pai-patience', default=2, type=int,
-                       help='ReduceLROnPlateau patience, in validations')
+                       help='ReduceLROnPlateau patience, in validations (--pai-schedule plateau)')
+    group.add_argument('--pai-schedule', default='plateau', choices=['plateau', 'cosine'],
+                       help='LR scheduler PAI builds for every phase: ReduceLROnPlateau, or '
+                            'CosineAnnealingLR from the phase\'s starting LR to 0 over '
+                            '--pai-cosine-epochs validations. PAI rebuilds and steps it (once per '
+                            'validation), as in PAI\'s ResNet example; each phase restarts it.')
+    group.add_argument('--pai-p-lr-scaling', default='none', choices=['none', 'linear', 'sqrt'],
+                       help='with --accum-freq k, dendrite (p) phases step once per microbatch of '
+                            'batch/k, so scale their LR by 1/k (linear) or 1/sqrt(k) (sqrt). '
+                            'none keeps --lr, as PAI runs did before this option.')
+    group.add_argument('--pai-cosine-epochs', default=None, type=int, metavar='N',
+                       help='T_max of --pai-schedule cosine, in validations (one per epoch with '
+                            '--log-steps = steps per epoch)')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
 
@@ -205,6 +218,14 @@ def check_args(parser, args):
         parser.error('--pai-warmup must be non-negative')
     if args.pai_fixed_switch is not None and args.pai_fixed_switch < 1:
         parser.error('--pai-fixed-switch must be at least 1')
+    if args.pai_schedule == 'cosine':
+        if not args.pai_cosine_epochs or args.pai_cosine_epochs < 1:
+            parser.error('--pai-schedule cosine needs --pai-cosine-epochs >= 1')
+        if args.pai_warmup:
+            # warmup_lr overwrites the LR, and CosineAnnealingLR computes each LR from the last.
+            parser.error('--pai-warmup is not supported with --pai-schedule cosine')
+    elif args.pai_cosine_epochs is not None:
+        parser.error('--pai-cosine-epochs applies only to --pai-schedule cosine')
     if args.pai_resume and args.pai_init:
         parser.error('--pai-resume and --pai-init are mutually exclusive')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
@@ -510,6 +531,10 @@ def perforate(model, args):
     pc.set_max_dendrites(args.max_dendrites)
     pc.set_n_epochs_to_switch(args.pai_n_epochs_to_switch)
     pc.set_p_epochs_to_switch(args.pai_p_epochs_to_switch)
+    if args.pai_schedule == 'cosine':
+        # PAI's default LR search after structural changes (find_best_lr) would override the
+        # cosine's LRs; PAI also says it only suits step-based schedulers.
+        pc.set_find_best_lr(False)
     if getattr(args, 'pai_fixed_switch', None):
         pc.set_switch_mode(pc.DOING_FIXED_SWITCH)
         pc.set_n_fixed_switch_num(args.pai_fixed_switch)
@@ -548,19 +573,43 @@ def decays(name, param):
 
 def setup_optimizer(model, args):
     # PAI builds the optimizer itself so it can swap to dendrite-only parameters in dendrite
-    # phases. PAI steps the scheduler from validation scores; main.py must not step it.
+    # phases, and builds and steps the scheduler (from validation scores for ReduceLROnPlateau,
+    # once per validation for CosineAnnealingLR); main.py must not step it. Called again after
+    # every restructure, so each phase gets a fresh scheduler starting at its full LR.
     GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
-    GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
     # Weight decay on weight matrices only, as main.py's baseline optimizer does: biases,
     # LayerNorm gains and the like get none. PAI keeps parameter groups (minus parameters that
     # do not require grad in the current phase), so this holds in every phase, dendrites included.
     named = list(model.named_parameters())
     groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
-    opt_args = {'params': groups, 'lr': args.lr, 'betas': (args.beta1, args.beta2),
+    lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
+    opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': args.weight_decay}
-    sched_args = {'mode': 'max', 'patience': args.pai_patience}
-    return GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
+    if args.pai_schedule == 'cosine':
+        # Decays to 0 like main.py's baseline cosine (eta_min 0), but per validation, not per step.
+        GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.CosineAnnealingLR)
+        sched_args = {'T_max': args.pai_cosine_epochs, 'eta_min': 0.0}
+    else:
+        GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.ReduceLROnPlateau)
+        sched_args = {'mode': 'max', 'patience': args.pai_patience}
+    optimizer, scheduler = GPA.pai_tracker.setup_optimizer(model, opt_args, sched_args)
+    # PAI adds dendrite parameters to the groups itself; log what each group ends up with.
+    phase = 'dendrite' if in_dendrite_phase() else 'neuron'
+    print(f"=> {phase}-phase optimizer (--lr {args.lr:.3g}, --pai-p-lr-scaling {args.pai_p_lr_scaling}, "
+          f"--accum-freq {args.accum_freq}): " + "; ".join(
+              f"group {i}: {sum(p.numel() for p in g['params'])} params, lr {g['lr']:.3g}, "
+              f"weight_decay {g['weight_decay']:.3g}" for i, g in enumerate(optimizer.param_groups)))
+    return optimizer, scheduler
+
+
+def p_lr_factor(args):
+    """LR factor for dendrite phases, where each microbatch (batch / accum_freq) is a step."""
+    if args.pai_p_lr_scaling == 'linear':
+        return 1 / args.accum_freq
+    if args.pai_p_lr_scaling == 'sqrt':
+        return 1 / math.sqrt(args.accum_freq)
+    return 1.0
 
 
 def add_score(model, acc1, args, device, force_switch=False):
