@@ -114,7 +114,8 @@ def check_perforation(layers, target):
     if perforated != sorted(layers):
         fail(f'expected dendrites on layers {sorted(layers)}, got {perforated}')
     print(f'\nWrapped unit of layer {layers[0]}:')
-    print(model.encoder.layers[layers[0]].mlp if target in ('mlp', 'ln_mlp') else model.encoder.layers[layers[0]])
+    block = model.encoder.layers[layers[0]]
+    print(block.mlp if target in ('mlp', 'ln_mlp') else block.self_attention if target in ('qk', 'qkv') else block)
 
     model = model.cuda().train()
     x = torch.randn(8, 3, 224, 224, device='cuda')
