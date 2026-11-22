@@ -833,8 +833,12 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     print(f"=> PAI restructured the model at step {step}")
                     optimizer, scheduler = pai_setup.setup_optimizer(model, args)
                 image_data = pai_images.collect(step, wandb if args.wandb and is_primary(args) else None)
+                pai_stats = pai_setup.stats()
+                pb = {k.removeprefix('pai/'): v for k, v in pai_stats.items() if k.startswith('pai/pb_')}
+                if pb and is_primary(args):
+                    print('=> PB scores: ' + ', '.join(f'{k} {v:.6g}' for k, v in pb.items()))
                 if args.wandb and is_primary(args):
-                    wandb.log({**pai_setup.stats(), **image_data, 'epoch': step / args.steps_per_epoch},
+                    wandb.log({**pai_stats, **image_data, 'epoch': step / args.steps_per_epoch},
                               step=step)
 
             if is_primary(args):

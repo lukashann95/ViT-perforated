@@ -10,12 +10,24 @@ class PAIImages:
         self.source = self.root / 'pai'
         self.archive = self.root / 'pai_images'
         self.seen = {}
+        self.live_csvs = set()
 
     def collect(self, step, wandb=None):
-        """Return W&B media for changed plots; archive even when W&B is disabled."""
+        """Return W&B media for changed plots; archive even when W&B is disabled.
+
+        PAI's csv files (PB scores, scores, learning rates, ...) are uploaded to W&B as live
+        files under pai/, re-synced whenever PAI rewrites them."""
         media = {}
         raster = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp'}
         for path in sorted(self.source.rglob('*')):
+            if wandb is not None and path.is_file() and path.suffix.lower() == '.csv' \
+                    and path not in self.live_csvs:
+                try:
+                    wandb.save(str(path), base_path=str(self.root), policy='live')
+                    self.live_csvs.add(path)
+                except Exception as exc:
+                    warnings.warn(f'Could not upload PAI csv {path}: {exc}')
+                continue
             if not path.is_file() or path.suffix.lower() not in raster | {'.svg', '.pdf'}:
                 continue
             relative = path.relative_to(self.source)
