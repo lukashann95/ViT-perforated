@@ -27,7 +27,7 @@
 #                                                                    the linear-scaled 256 setup)
 #   256, linear LR scaling:      PEAK_LR=2.5e-4 BATCH=256
 #   256, sqrt LR scaling:        PEAK_LR=5e-4   BATCH=256
-# Env: CKPT, PEAK_LR, BATCH (required); ACCUM (default 1); SCALES (default "0.01 0.1 1 10 100");
+# Env: CKPT (or CKPT_WANDB), PEAK_LR, BATCH (required); ACCUM (default 1); SCALES (default "0.01 0.1 1 10 100");
 # GD=1 uses PAI's gradient-descent dendrites (--pai-gd) instead of Perforated Backpropagation;
 #   run names then carry "gd" instead of "pb". GD has no separate dendrite (p) phase: after the
 #   forced switch the dendrite is trained together with the (unfrozen) neurons in a neuron phase,
@@ -45,10 +45,12 @@
 # DATA, GPU, WORKERS, WANDB_ENTITY / WANDB_PROJECT: see scripts/machine_env.sh
 # (defaults ~/data/imagenet, 0, CPU cores - 1, IdlF26Group40 / ViT-perforated; Delta unpacks the
 # dataset to node-local disk once for all scales).
+# CKPT_WANDB=<run name> instead of CKPT downloads that run's W&B checkpoint artifact
+# (checkpoint-<run name>:last, from runs with --wandb-checkpoints) to $LOGS/ckpts/<run name>/.
 # Needs PAIEMAIL/PAITOKEN (environment, the repo's .env or ~/.pai_env); W&B reads
 # WANDB_API_TOKEN from .env.
 set -euo pipefail
-: "${CKPT:?set CKPT to a plain main.py checkpoint}"
+[ -n "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "set CKPT to a plain main.py checkpoint, or CKPT_WANDB to its run name" >&2; exit 1; }
 : "${PEAK_LR:?set PEAK_LR to the peak LR of the neuron run}"
 : "${BATCH:?set BATCH to 1024 or 256}"
 ACCUM=${ACCUM:-1}
@@ -73,7 +75,6 @@ else
     # With --pai-fixed-switch the p phase lasts exactly --pai-p-epochs-to-switch validations.
     SWITCH_ARGS=(--pai-fixed-switch 1000 --pai-p-epochs-to-switch "$P_EPOCHS")
 fi
-test -r "$CKPT"
 
 # sbatch runs a copy of this script, so under Slurm the repo is where sbatch was called from.
 REPO=${REPO:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}" && pwd)}
@@ -84,6 +85,22 @@ LOGS=${LOGS:-$HOME/runs}
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
 cd "$REPO"
+if [ -z "${CKPT:-}" ]; then
+    CKPT=$LOGS/ckpts/$CKPT_WANDB/checkpoint.pth.tar
+    if [ ! -r "$CKPT" ]; then
+        "$PYTHON" - "$CKPT_WANDB" "$(dirname "$CKPT")" <<'PY'
+import os, sys, wandb
+run, dest = sys.argv[1:]
+path = f"{os.environ['WANDB_ENTITY']}/{os.environ['WANDB_PROJECT']}/checkpoint-{run}:last"
+artifact = wandb.Api(api_key=os.environ.get('WANDB_API_TOKEN') or None).artifact(path, type='model')
+artifact.download(dest)
+print(f"=> downloaded {path} (step {artifact.metadata.get('step')}, "
+      f"acc@1 {artifact.metadata.get('acc1')}) to {dest}")
+PY
+    fi
+fi
+test -r "$CKPT" || { echo "cannot read CKPT=$CKPT" >&2; exit 1; }
+COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit (no .git)")
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
 
@@ -99,7 +116,7 @@ for K in $SCALES; do
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
-         "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $(git log --oneline -1)"
+         "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $COMMIT"
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
     # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
     if ! "$PYTHON" -u main.py "$DATA" \
