@@ -1,8 +1,9 @@
 #!/bin/bash
 # Dendrite-phase LR ablation for one plain (non-PAI) ViT-Tiny checkpoint: for each LR scale K,
-# perforate the MLP of block 11 and train only the first Perforated Backpropagation dendrite (p)
-# phase for 25 epochs, cosine from K x PEAK_LR down to 0, with no weight decay. Look at PAI's
-# PB-score plots (<run>/pai_images, W&B), not validation accuracy. The runs go one after another:
+# perforate block 11 (TARGET, default its pre-norm and whole MLP) and train only the first
+# Perforated Backpropagation dendrite (p) phase for 25 epochs, cosine from K x PEAK_LR down to 0,
+# with no weight decay. Look at PAI's PB-score plots (<run>/pai_images, W&B), not validation
+# accuracy. The runs go one after another:
 #   CKPT=/path/model_best.pth.tar PEAK_LR=1e-3 BATCH=1024 scripts/pai_p_lr_ablation.sh
 # As one task-spooler job on riddle GPU 1:
 #   forgeq-gpu 1 -L plr env GPU=1 CKPT=... PEAK_LR=2.5e-4 BATCH=256 ~/ViT-perforated/scripts/pai_p_lr_ablation.sh
@@ -16,7 +17,8 @@
 #   256, linear LR scaling:      PEAK_LR=2.5e-4 BATCH=256
 #   256, sqrt LR scaling:        PEAK_LR=5e-4   BATCH=256
 # Env: CKPT, PEAK_LR, BATCH (required); ACCUM (default 1); SCALES (default "0.01 0.1 1 10 100");
-# P_EPOCHS (default 25); LAYER (default 11); DATA (ImageFolder root, default ~/data/imagenet);
+# P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp;
+# default ln_mlp); DATA (ImageFolder root, default ~/data/imagenet);
 # LOGS (default ~/runs); GPU (default 0); WORKERS (default 14); WANDB=0 to skip W&B;
 # WANDB_ENTITY / WANDB_PROJECT (default IdlF26Group40 / ViT-perforated).
 # Needs PAIEMAIL/PAITOKEN (environment, ~/.pai_env or the repo's .env); W&B reads
@@ -29,6 +31,7 @@ ACCUM=${ACCUM:-1}
 SCALES=${SCALES:-0.01 0.1 1 10 100}
 P_EPOCHS=${P_EPOCHS:-25}
 LAYER=${LAYER:-11}
+TARGET=${TARGET:-ln_mlp}
 DATA=${DATA:-$HOME/data/imagenet}
 LOGS=${LOGS:-$HOME/runs}
 GPU=${GPU:-0}
@@ -56,7 +59,7 @@ STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_l${LAYER}_b${BATCH}_acc${ACCUM}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME: LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
@@ -70,10 +73,10 @@ for K in $SCALES; do
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
         --epochs "$P_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
         --lr "$LR" --wd 0 --workers "$WORKERS" \
-        --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target ln_mlp --max-dendrites 1 \
+        --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites 1 \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
         --pai-fixed-switch 1000 --pai-p-epochs-to-switch "$P_EPOCHS" \
-        --wandb-notes "p-phase LR ablation from $CKPT, K=$K, peak LR $PEAK_LR" \
+        --wandb-notes "p-phase LR ablation from $CKPT, K=$K, peak LR $PEAK_LR, target $TARGET" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
         FAILED+=("$K")   # e.g. K=100 diverging; keep going with the other scales
     fi
