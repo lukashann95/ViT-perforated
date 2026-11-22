@@ -23,6 +23,10 @@
 #   so K x PEAK_LR and WD apply to the whole network, there are no PB scores (judge by val/acc@1),
 #   --pai-p-lr-scaling has no effect, and --accum-freq accumulates exactly (ACCUM=4 at BATCH=1024
 #   is one true 1024 batch, which is what makes it fit in 24 GB);
+# MAX_DENDRITES (default 1; >1 needs GD=1): dendrite rounds. The forced switch at the start adds
+#   the first; each later round is added by a fixed switch after another P_EPOCHS epochs. Every
+#   round gets its own P_EPOCHS-epoch cosine from K x PEAK_LR to 0 (PAI restarts the scheduler at
+#   each switch), so a run lasts MAX_DENDRITES x P_EPOCHS epochs;
 # WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
 #   with GD it applies to every weight matrix (the baseline used 1e-4);
 # P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp;
@@ -46,7 +50,21 @@ GPU=${GPU:-0}
 WORKERS=${WORKERS:-14}
 WD=${WD:-0}
 GD=${GD:-0}
+MAX_DENDRITES=${MAX_DENDRITES:-1}
 if [ "$GD" = 1 ]; then GD_ARGS=(--pai-gd); MODE=gd; else GD_ARGS=(); MODE=pb; fi
+if [ "$MAX_DENDRITES" -lt 1 ]; then echo "MAX_DENDRITES must be >= 1" >&2; exit 1; fi
+if [ "$MAX_DENDRITES" -gt 1 ] && [ "$GD" != 1 ]; then
+    # PB alternates p and n phases, so its schedule for several rounds is not this one.
+    echo "MAX_DENDRITES > 1 is only set up for GD=1" >&2; exit 1
+fi
+TOTAL_EPOCHS=$((P_EPOCHS * MAX_DENDRITES))
+if [ "$MAX_DENDRITES" -gt 1 ]; then
+    # GD stays in neuron phases; the next round comes after P_EPOCHS validations.
+    SWITCH_ARGS=(--pai-fixed-switch "$P_EPOCHS" --pai-p-epochs-to-switch "$P_EPOCHS")
+else
+    # With --pai-fixed-switch the p phase lasts exactly --pai-p-epochs-to-switch validations.
+    SWITCH_ARGS=(--pai-fixed-switch 1000 --pai-p-epochs-to-switch "$P_EPOCHS")
+fi
 test -r "$CKPT"
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -65,29 +83,28 @@ if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
 # One validation per epoch of the 20% subset (256,190 images), so PAI's epochs are real epochs;
 # stop right after the P_EPOCHS-th validation, where the fixed switch ends the p phase.
 LOG_STEPS=$((256190 / BATCH))
-MAX_STEPS=$((P_EPOCHS * LOG_STEPS))
+MAX_STEPS=$((TOTAL_EPOCHS * LOG_STEPS))
 STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
-         "over $P_EPOCHS epochs, from $CKPT, commit $(git log --oneline -1)"
+         "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $(git log --oneline -1)"
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
-    # With --pai-fixed-switch the p phase lasts exactly --pai-p-epochs-to-switch validations.
     # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
     if ! "$python" -u main.py "$DATA" \
         --gpu 0 --train-fraction 0.2 --subset-seed 42 \
         --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
-        --epochs "$P_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
+        --epochs "$TOTAL_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
         --lr "$LR" --wd "$WD" --workers "$WORKERS" \
-        --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites 1 "${GD_ARGS[@]}" \
+        --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
-        --pai-fixed-switch 1000 --pai-p-epochs-to-switch "$P_EPOCHS" \
-        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, target $TARGET" \
+        "${SWITCH_ARGS[@]}" \
+        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, dendrites $MAX_DENDRITES, target $TARGET" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
         FAILED+=("$K")   # e.g. K=100 diverging; keep going with the other scales
     fi
