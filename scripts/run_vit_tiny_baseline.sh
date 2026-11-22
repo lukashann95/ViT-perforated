@@ -8,7 +8,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --output=/projects/bjto/lhann/runs/slurm-%j.out
-# Baseline benchmark: ViT-Tiny/16 (no PAI), 20% stratified ImageNet-1k subset,
+# Baseline benchmark: ViT-Tiny/16 (no PAI), 20% stratified ImageNet-1k subset (TRAIN_FRACTION),
 # FP32 with TF32 tensor-core matmuls/convs (--tf32; no effect on GPUs without TF32, e.g. V100),
 # single GPU. Effective batch BATCH (default 1024), split into microbatches to fit in memory.
 #
@@ -29,6 +29,10 @@
 #   IMAGENET    dataset path with train/ and val/ (default: $HOME/data/imagenet; Delta: unpacked
 #               to node-local disk, see machine_env.sh)
 #   EPOCHS      training epochs                   (default: 90)
+#   TRAIN_FRACTION  share of ImageNet's training set (default: 0.2, the stratified subset with
+#               --subset-seed 42; 1 = all 1.28M images, epochs then take 5x as many steps)
+#   WARMUP      linear LR warmup steps            (default: 2000 x 1024/BATCH; the old full-data
+#               8xV100 run vit_tiny_amp_8v100_49682577 used 10000)
 #   LOG_EPOCHS  extra checkpoint/validation epochs(default: "30 60")
 #   BATCH       effective batch size              (default: 1024)
 #   SCALING     how LR follows BATCH from the 1024 baseline (LR 1e-3):
@@ -45,6 +49,8 @@
 # each step decays the weights by --wd (times the LR schedule's fraction of its peak), and this
 # keeps the decay per epoch of the 1024 baseline. Scaling it with the LR would give the sqrt arm
 # twice the baseline's decay per epoch.
+# Full ImageNet, as the old 8xV100 run (70.06% top-1), on one Delta A40 (~17 h):
+#   sbatch --export=ALL,ACCUM=1,TRAIN_FRACTION=1,WARMUP=10000 scripts/run_vit_tiny_baseline.sh
 # Batch-256 runs with linear and sqrt LR scaling (run names get _b256_linear / _b256_sqrt):
 #   BATCH=256 SCALING=linear ./scripts/run_vit_tiny_baseline.sh
 #   BATCH=256 SCALING=sqrt ./scripts/run_vit_tiny_baseline.sh
@@ -69,15 +75,20 @@ case "$SCALING" in
 esac
 LR=$(awk "BEGIN { printf \"%g\", 1e-3 * $SCALE }")
 WD=$(awk "BEGIN { printf \"%g\", 1e-4 * $BATCH / 1024 }")
-WARMUP=$(( 2000 * 1024 / BATCH ))
+WARMUP="${WARMUP:-$(( 2000 * 1024 / BATCH ))}"
+TRAIN_FRACTION="${TRAIN_FRACTION:-0.2}"
+PCT=$(awk "BEGIN { printf \"%g\", 100 * $TRAIN_FRACTION }")
 # Name tag only for non-default batch sizes, so batch-1024 run names stay as before.
 TAG=
 if [ "$BATCH" != 1024 ]; then
     TAG="_b${BATCH}"
     if [ "$SCALING" != none ]; then TAG="${TAG}_${SCALING}"; fi
 fi
+if [ "$WARMUP" != $(( 2000 * 1024 / BATCH )) ]; then TAG="${TAG}_wu${WARMUP}"; fi
 LOG_ROOT="$REPO/logs"
-RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_20pct_${EPOCHS}ep${TAG}_subset42_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
+SUBSET_TAG=_subset42
+if [ "$PCT" = 100 ]; then SUBSET_TAG=; fi
+RUN_NAME="${RUN_NAME:-vit_tiny_tf32_1gpu_${PCT}pct_${EPOCHS}ep${TAG}${SUBSET_TAG}_$(hostname -s)_$(date +%Y%m%d_%H%M%S)}"
 
 test -f "$REPO/.env" || { echo "No $REPO/.env with WANDB_API_TOKEN"; exit 1; }
 if [ -n "${IMAGENET:-}" ]; then DATA=$IMAGENET; fi
@@ -96,13 +107,13 @@ if [ "${WANDB_CKPT:-1}" = 1 ]; then CKPT_ARGS=(--wandb-checkpoints); fi
 export WANDB_DIR="$LOG_ROOT/$RUN_NAME"
 mkdir -p "$WANDB_DIR"
 
-echo "Run: $RUN_NAME | GPU: ${CUDA_VISIBLE_DEVICES:-all} | epochs: $EPOCHS | batch: $BATCH | accum: $ACCUM | lr: $LR | wd: $WD | warmup: $WARMUP | workers: $WORKERS"
+echo "Run: $RUN_NAME | GPU: ${CUDA_VISIBLE_DEVICES:-all} | data: ${PCT}% | epochs: $EPOCHS | batch: $BATCH | accum: $ACCUM | lr: $LR | wd: $WD | warmup: $WARMUP | workers: $WORKERS"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # shellcheck disable=SC2086  # LOG_EPOCHS is a space-separated list on purpose
 "$PYTHON" -u main.py "$DATA" \
     --gpu 0 \
-    --train-fraction 0.2 \
+    --train-fraction "$TRAIN_FRACTION" \
     --subset-seed 42 \
     --hidden-dim 192 \
     --num-layers 12 \
