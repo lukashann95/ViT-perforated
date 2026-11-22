@@ -616,8 +616,16 @@ def add_score(model, acc1, args, device, force_switch=False):
     """Report a validation score. Returns (model, restructured, training_complete)."""
     # Percent, so PAI's improvement thresholds behave as they did in the HW1 experiments.
     # Actual return order is (net, restructured, training_complete); the docstring lists it differently.
+    # PAI appends this epoch's PB scores inside add_validation_score and, when it ends the dendrite
+    # phase, replaces its score lists with new empty ones, so hold on to the old lists.
+    global _pb_scores
+    best_scores = GPA.pai_tracker.member_vars.get('best_scores') if in_dendrite_phase() else None
     model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
         100 * acc1, model, force_switch=force_switch)
+    _pb_scores = {}
+    for module, scores in zip(GPA.pai_tracker.neuron_module_vector, best_scores or []):
+        if len(scores):
+            _pb_scores[f'pai/pb_best/{short_module_name(module.name)}'] = float(scores[-1])
     if restructured:
         register_diagnostics(model)
     return model.to(device), bool(restructured), training_complete
@@ -635,6 +643,15 @@ def in_dendrite_phase():
     return GPA.pai_tracker.member_vars.get('mode') == 'p'
 
 
+# Best PB score so far of each perforated module after the latest dendrite-phase validation
+# (the numbers in PAI's Best PBScores csv and plot), keyed like 'pai/pb_best/layer11.mlp'.
+_pb_scores = {}
+
+
+def short_module_name(name):
+    return name.removeprefix('.').removeprefix('encoder.layers.').replace('encoder_layer_', 'layer')
+
+
 def stats():
     member_vars = GPA.pai_tracker.member_vars
     return {
@@ -642,4 +659,5 @@ def stats():
         'pai/dendrites_added': member_vars.get('num_dendrites_added', 0),
         # PAI's count excludes candidate-dendrite scaffolding, so it is the real model size.
         'pai/params': (member_vars.get('param_counts') or [0])[-1],
+        **_pb_scores,
     }
