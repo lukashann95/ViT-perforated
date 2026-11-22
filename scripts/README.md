@@ -1,4 +1,4 @@
-# Running on riddle, the 3090 PC and Delta
+# Running on riddle, the 3090 PC, Delta and the L40S
 
 Set up a machine once with `setup_machine.sh` (see the repo's `README.md`). After that you start every run
 through one of two launchers. They run unchanged on every machine, because `machine_env.sh` handles what
@@ -7,9 +7,11 @@ differs between them.
 | Script | What it does |
 |---|---|
 | `run_vit_tiny_baseline.sh` | plain ViT-Tiny/16 (no PAI), 90-epoch cosine, 20% ImageNet subset |
-| `pai_p_lr_ablation.sh` | dendrite-phase LR ablation: perforate block 11 of a plain checkpoint, train only the first dendrite phase at five LR scales |
+| `pai_p_lr_ablation.sh` | dendrite-phase LR ablation: perforate block 11 (`TARGET`) of a plain checkpoint, train only the first dendrite phase at five LR scales |
 | `machine_env.sh` | sourced by both launchers: dataset, workers, Python, credentials, W&B project, GPU |
 | `delta_pai_resume.sbatch` | older Delta-only launcher for plateau-schedule PAI runs (and continuing them after a timeout) |
+| `l40_pai_resume.sbatch` | Vamsi's L40 version of it (any Slurm cluster; setup in its header) |
+| `l40_pai_p_lr_ablation.sbatch` | `pai_p_lr_ablation.sh` as a Slurm job on an L40 / L40S (generic `#SBATCH` lines) |
 | `setup_machine.sh`, `smoke_test.py` | one-time machine setup and its GPU check |
 | `parquet_to_imagefolder.py` | unpacks the parquet shards into `train/<wnid>/`, `val/<wnid>/` |
 | `export_plain_checkpoint.py` | turns a PAI checkpoint into a plain ViT checkpoint |
@@ -19,7 +21,9 @@ Both launchers take their settings from environment variables (listed in each sc
 
 | Variable | Default |
 |---|---|
-| `DATA` (`IMAGENET` for the baseline) | `~/data/imagenet`; Delta: unpacked per job, see below |
+| `DATA` (`IMAGENET` for the baseline) | `~/data/imagenet` or `<repo parent>/imagenet` if one exists; otherwise (and always on Delta) the parquet shards are unpacked per job, see below |
+| `PARQUET_DIR` | the shards to unpack: Delta's shared copy, elsewhere `<repo parent>/imagenet_1k_resized_256/data` (where `setup_machine.sh` downloads them) |
+| `LOGS` (ablation) | `~/runs`; Delta: `/projects/bjto/$USER/runs`; L40 sbatch: `<repo parent>/runs` |
 | `GPU` | `0`; under Slurm the GPU the job was given |
 | `WORKERS` | CPU cores - 1; under Slurm, CPUs - 2 |
 | `WANDB_ENTITY` / `WANDB_PROJECT` | `IdlF26Group40` / `ViT-perforated` |
@@ -94,10 +98,14 @@ sbatch --export=ALL,ACCUM=1 scripts/run_vit_tiny_baseline.sh
 squeue -u $USER; tail -f /projects/bjto/lhann/runs/slurm-<job id>.out
 ```
 
-### L40S (babel)
+### L40S
 
-Vamsi's L40S runs use a Docker image and their own launcher on the unmerged `l40-pai-resume` branch
-(`docker/README.md`, `scripts/l40_pai_resume.sbatch`). They don't use these launchers yet.
+A Slurm cluster run by a friend of Vamsi's. The L40S has 48 GB, so batch 1024 fits in one pass
+(`ACCUM=1`). Set the machine up once with `scripts/setup_machine.sh` on the login node (venvs, keys in
+`.env`, parquet shards in `<repo parent>/imagenet_1k_resized_256/data`), then submit
+`l40_pai_p_lr_ablation.sbatch` (the sweep) or `l40_pai_resume.sbatch` (plateau runs) from the repo root
+with the cluster's partition and account (`-p`, `-A`). Each job unpacks the shards to `$SLURM_TMPDIR`
+(or `/tmp`); runs go to `<repo parent>/runs`, the Slurm log to the directory you submitted from.
 
 ## Recipes
 
@@ -123,12 +131,11 @@ RUN_NAME=<run> ./scripts/run_vit_tiny_baseline.sh --resume <repo>/logs/<run>/che
 ### Dendrite-phase LR ablation
 
 You need a finished plain checkpoint. Use `checkpoint.pth.tar` (the final step), not `model_best.pth.tar`.
-It is either in the run's `logs/<run>/checkpoints/` on the machine that trained it, or on W&B:
+It is either in the run's `logs/<run>/checkpoints/` on the machine that trained it (`CKPT=<path>`), or on
+W&B: `CKPT_WANDB=<run>` downloads `checkpoint-<run>:last` to `$LOGS/ckpts/<run>/` (once; later sweeps reuse it).
 
-```bash
-WANDB_API_KEY=$(grep ^WANDB_API_TOKEN= .env | cut -d= -f2) \
-  .venv/bin/wandb artifact get IdlF26Group40/ViT-perforated/checkpoint-<run>:last --root ~/runs/ckpts/<run>
-```
+`TARGET` picks what gets dendrites in block 11: `ln_mlp` (default: `ln_2` with the whole MLP) or `ln_fc1`
+(`ln_2` with the first Linear only); also `fc1`, `fc2`, `mlp`.
 
 One call runs all five scales k ∈ {0.01, 0.1, 1, 10, 100} one after another. Each one takes about 2 h on a
 4090 at batch 256. The four setups:
@@ -142,10 +149,15 @@ One call runs all five scales k ∈ {0.01, 0.1, 1, 10, 100} one after another. E
 
 ```bash
 # riddle / 3090 PC
-GPU=1 WORKERS=8 CKPT=<checkpoint> PEAK_LR=5e-4 BATCH=256 ./scripts/pai_p_lr_ablation.sh
+GPU=1 WORKERS=8 CKPT=<checkpoint> PEAK_LR=5e-4 BATCH=256 TARGET=ln_fc1 ./scripts/pai_p_lr_ablation.sh
 # Delta
 sbatch --export=ALL,CKPT=<checkpoint>,PEAK_LR=1e-3,BATCH=1024 scripts/pai_p_lr_ablation.sh
+# L40S
+sbatch -p <partition> -A <account> \
+  --export=ALL,CKPT_WANDB=<run>,PEAK_LR=1e-3,BATCH=1024,TARGET=ln_fc1 scripts/l40_pai_p_lr_ablation.sbatch
 ```
 
-Runs are named `vit_tiny_pai_plr_l11_b<batch>_acc<accum>_k<k>_<time>`. Judge them by the PB-score plots
-(`<run>/pai_images`, W&B), not by validation accuracy. Per Rorry, PB scores under 0.01 are noise.
+Runs are named `vit_tiny_pai_plr_l11_<target>_b<batch>_acc<accum>_lr<peak LR>_k<k>_<time>` (runs before
+11-22 lack the target and LR). Judge them by PB scores, not by validation accuracy: W&B logs the best score
+so far as `pai/pb_best/<module>` (e.g. `layer11.mlp` for `ln_mlp`, `layer11.mlp.0` for `ln_fc1`) and keeps
+PAI's csv files under `pai/`; the plots are in `<run>/pai_images`. Per Rorry, PB scores under 0.01 are noise.
