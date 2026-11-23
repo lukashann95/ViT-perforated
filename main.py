@@ -685,6 +685,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
     # the source run's best model (which PAI reloads at a switch) after its first step.
     best_model_pending = args.pai and bool(args.pai_resume)
+    # Validations in this loop, for --pai-control-restarts (the initial --pai-init score is not counted).
+    validations = 0
     for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -832,6 +834,17 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 if restructured:
                     print(f"=> PAI restructured the model at step {step}")
                     optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+                validations += 1
+                if (args.pai_control_restarts and validations % args.pai_fixed_switch == 0
+                        and validations // args.pai_fixed_switch <= args.pai_control_restarts):
+                    # Mirror the GD arm, which restructures here: fresh AdamW, LR schedule restarted.
+                    print(f"=> control arm: rebuilt optimizer and scheduler at step {step} "
+                          f"(validation {validations}), where the GD arm adds dendrites")
+                    optimizer, scheduler = pai_setup.setup_optimizer(model, args)
+                if training_complete and args.pai_control_restarts:
+                    # A control arm never adds dendrites; run for --max-steps like the GD arm.
+                    print(f"=> control arm: ignoring PAI's training-complete signal at step {step}")
+                    training_complete = False
                 image_data = pai_images.collect(step, wandb if args.wandb and is_primary(args) else None)
                 pai_stats = pai_setup.stats()
                 pb = {k.removeprefix('pai/'): v for k, v in pai_stats.items() if k.startswith('pai/pb_')}

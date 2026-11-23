@@ -202,6 +202,11 @@ def add_arguments(parser):
     group.add_argument('--pai-cosine-epochs', default=None, type=int, metavar='N',
                        help='T_max of --pai-schedule cosine, in validations (one per epoch with '
                             '--log-steps = steps per epoch)')
+    group.add_argument('--pai-control-restarts', default=0, type=int, metavar='N',
+                       help='--pai-control arm of a --pai-gd run with --max-dendrites N+1: rebuild the '
+                            'optimizer and scheduler every --pai-fixed-switch validations, N times, where '
+                            'the GD arm restructures (fresh AdamW, LR schedule restarted), and keep '
+                            'training past PAI\'s training-complete signal until --max-steps')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
 
@@ -232,6 +237,10 @@ def check_args(parser, args):
         parser.error(f'--pai-layers must be in [0, {args.num_layers})')
     if args.distributed or args.ngpus_per_node > 1:
         parser.error('PAI runs support a single GPU only; pass --gpu 0')
+    if args.pai_control_restarts < 0:
+        parser.error('--pai-control-restarts must be non-negative')
+    if args.pai_control_restarts and not (args.pai_control and args.pai_fixed_switch):
+        parser.error('--pai-control-restarts needs --pai-control and --pai-fixed-switch')
     if args.resume and (args.pai_resume or args.pai_init):
         parser.error('--resume continues a PAI run; it excludes --pai-resume and --pai-init')
 
