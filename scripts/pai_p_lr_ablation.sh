@@ -43,6 +43,8 @@
 # TRAIN_FRACTION (default 0.2, the stratified subset with seed 42; 1 = all of ImageNet; run names
 #   carry _f<fraction>). P_EPOCHS counts epochs of that training set: 5 full-data epochs are as
 #   many steps as 25 subset epochs;
+# CLEAN=1 trains without augmentation: no MixUp, no RandAugment, and the crop always takes the
+#   whole image (only the random flip and aspect ratio remain); run names then carry _clean.
 # P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
 # default ln_mlp); LOGS (default ~/runs; Delta: /projects/bjto/$USER/runs); WANDB=0 to skip W&B.
 # DATA, GPU, WORKERS, WANDB_ENTITY / WANDB_PROJECT: see scripts/machine_env.sh
@@ -69,6 +71,12 @@ case "$TRAIN_FRACTION" in
     *)   echo "TRAIN_FRACTION must be 0.2 or 1 (the training-set size of other fractions is not known here)" >&2; exit 1 ;;
 esac
 WD=${WD:-0}
+CLEAN=${CLEAN:-0}
+if [ "$CLEAN" = 1 ]; then
+    CLEAN_ARGS=(--mixup-alpha 0 --no-randaug --lower-scale 1 --upper-scale 1); CLEAN_TAG=_clean
+else
+    CLEAN_ARGS=(); CLEAN_TAG=
+fi
 GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
 if [ "$GD" = 1 ]; then GD_ARGS=(--pai-gd); MODE=gd; else GD_ARGS=(); MODE=pb; fi
@@ -127,7 +135,7 @@ STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}${CLEAN_TAG}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
@@ -142,8 +150,8 @@ for K in $SCALES; do
         --lr "$LR" --wd "$WD" --workers "$WORKERS" \
         --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
-        "${SWITCH_ARGS[@]}" \
-        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, train fraction $TRAIN_FRACTION, dendrites $MAX_DENDRITES, target $TARGET" \
+        "${SWITCH_ARGS[@]}" "${CLEAN_ARGS[@]}" \
+        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, train fraction $TRAIN_FRACTION, clean $CLEAN, dendrites $MAX_DENDRITES, target $TARGET" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
         FAILED+=("$K")   # e.g. K=100 diverging; keep going with the other scales
     fi
