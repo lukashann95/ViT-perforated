@@ -19,7 +19,7 @@
 #   DRY_RUN=1 ...   print the main.py command and exit
 #
 # Env: CKPT or CKPT_WANDB (required; CKPT_VERSION default last); BATCH (1024), ACCUM (4), LR (1e-3),
-#   P_LR_SCALING (sqrt: dendrite LR = LR / sqrt(ACCUM); linear, none), WD (1e-4, the baseline's;
+#   P_LR_SCALING (sqrt: dendrite LR = LR / sqrt(ACCUM); linear, none), WD (0, as in pai_p_lr_ablation.sh;
 #   in dendrite phases it only reaches the candidates), P_EPOCHS (25), N_EPOCHS (50),
 #   MAX_DENDRITES (2), LAYERS ("9 10 11"), TARGET (ln_fc1), CLEAN (1), P_LOSS_SCALE (BATCH / ACCUM),
 #   RUN_SUFFIX (none), WANDB (1), WANDB_CKPTS (1: --wandb-checkpoints), LOGS (~/runs).
@@ -35,7 +35,7 @@ BATCH=${BATCH:-1024}
 ACCUM=${ACCUM:-4}
 LR=${LR:-1e-3}
 P_LR_SCALING=${P_LR_SCALING:-sqrt}
-WD=${WD:-1e-4}
+WD=${WD:-0}
 P_EPOCHS=${P_EPOCHS:-25}
 N_EPOCHS=${N_EPOCHS:-50}
 MAX_DENDRITES=${MAX_DENDRITES:-2}
