@@ -64,6 +64,8 @@ CLEAN_ARGS=()
 CLEAN_TAG=
 if [ "$CLEAN" = 1 ]; then CLEAN_ARGS=(--pai-p-clean-data); CLEAN_TAG=_clean; fi
 # P_LOSS_SCALE: --pai-p-loss-scale (default 1; e.g. the microbatch size BATCH/ACCUM, see main.py)
+# RUN_SUFFIX: appended to every run name, e.g. RUN_SUFFIX=_$USER to tell people's runs apart (default none)
+RUN_SUFFIX=${RUN_SUFFIX:-}
 P_LOSS_SCALE=${P_LOSS_SCALE:-1}
 if [ "$P_LOSS_SCALE" != 1 ]; then CLEAN_ARGS+=(--pai-p-loss-scale "$P_LOSS_SCALE"); CLEAN_TAG=${CLEAN_TAG}_ls${P_LOSS_SCALE}; fi
 WD=${WD:-0}
@@ -125,7 +127,7 @@ STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}${CLEAN_TAG}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}${CLEAN_TAG}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}${RUN_SUFFIX}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
