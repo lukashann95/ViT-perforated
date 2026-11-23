@@ -294,6 +294,20 @@ def add_arguments(parser):
                             '--log-steps = steps per epoch)')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
+    group.add_argument('--pai-p-clean-data', action='store_true',
+                       help='in dendrite (p) phases, train on the same training images without '
+                            'augmentation (the validation transform: Resize 256, CenterCrop) and '
+                            'without mixup. RandAugment, Inception crop and mixup add noise to the '
+                            'error signal the candidates correlate with (locally, with main.py, PB '
+                            'scores reached 0.14 with clean data vs 0.02-0.03 with the augmented '
+                            'data at batch 64). Neuron phases keep the usual augmented pipeline.')
+    group.add_argument('--pai-p-loss-scale', default=1.0, type=float, metavar='S',
+                       help='multiply the loss by S for the backward pass of dendrite (p) phases. '
+                            'Candidates learn from the error at the module output, which the '
+                            'batch-mean loss makes ~1/batch per sample; at batch 256-1024 the '
+                            'candidate gradients are then small enough that Adam\'s eps throttles '
+                            'them. S = the microbatch size restores per-sample magnitudes. PB '
+                            'scores are Pearson correlations, so S changes learning, not the metric.')
 
 
 def check_args(parser, args):
@@ -705,13 +719,15 @@ def setup_optimizer(model, args):
     GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
     # Weight decay on weight matrices only, as main.py's baseline optimizer does: biases,
     # LayerNorm gains and the like get none. PAI keeps parameter groups (minus parameters that
-    # do not require grad in the current phase), so this holds in every phase, dendrites included.
+    # do not require grad in the current phase). Dendrite phases use no weight decay on the
+    # candidates (as the p-phase LR ablations ran them, with --wd 0); --wd is for neuron phases.
     named = list(model.named_parameters())
-    groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
+    wd = 0.0 if in_dendrite_phase() else args.weight_decay
+    groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': wd},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
     lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
     opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
-                'weight_decay': args.weight_decay}
+                'weight_decay': wd}
     if args.pai_schedule == 'cosine':
         # Decays to 0 like main.py's baseline cosine (eta_min 0), but per validation, not per step.
         GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.CosineAnnealingLR)

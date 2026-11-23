@@ -489,6 +489,10 @@ def main_worker(gpu, args):
                 v2.Resize(256),
                 v2.CenterCrop(args.input_resolution),
             ]))
+        if args.pai and args.pai_p_clean_data:
+            # The training images with the validation transform, for dendrite phases.
+            clean_train_dataset = datasets.ImageFolder(
+                os.path.join(args.data, 'train'), transform=val_dataset.transform)
 
     if args.train_fraction < 1:
         full_size = len(train_dataset)
@@ -516,6 +520,8 @@ def main_worker(gpu, args):
         if subset_size == 0:
             raise ValueError('--train-fraction selects no training examples')
         train_dataset = Subset(train_dataset, indices)
+        if args.pai and args.pai_p_clean_data:
+            clean_train_dataset = Subset(clean_train_dataset, indices)
         print(f'Using {subset_size}/{full_size} training examples '
               f'({"random" if args.fake_data else "stratified"} subset, '
               f'subset seed: {args.subset_seed})')
@@ -546,6 +552,15 @@ def main_worker(gpu, args):
         val_dataset, batch_size=args.prefetch_factor * args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler,
         multiprocessing_context='spawn', prefetch_factor=1, persistent_workers=True)
+
+    clean_train_loader = None
+    if args.pai and args.pai_p_clean_data:
+        if args.fake_data or args.distributed:
+            raise ValueError('--pai-p-clean-data needs a real ImageFolder dataset on one GPU')
+        clean_train_loader = torch.utils.data.DataLoader(
+            clean_train_dataset, batch_size=args.prefetch_factor * args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True, drop_last=True,
+            multiprocessing_context='spawn', prefetch_factor=1, persistent_workers=True)
 
     if not args.pai:
         scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
@@ -610,7 +625,8 @@ def main_worker(gpu, args):
         # evaluate on validation set.
         validate(val_loader, model, args.start_step, device, args)
     else:
-        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args)
+        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args,
+              clean_train_loader=clean_train_loader)
         if args.wandb and args.wandb_checkpoints and is_primary(args):
             finish_checkpoint_uploads(args)
 
@@ -627,7 +643,8 @@ def infinite_loader(loader, sampler):
         epoch += 1
 
 
-def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args):
+def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args,
+          clean_train_loader=None):
     if args.max_steps is not None:
         total_steps = min(total_steps, start_step + args.max_steps)
         args.specified_steps.add(total_steps)
@@ -657,6 +674,22 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
     gen = train_batches()
 
+    def clean_batches():
+        # --pai-p-clean-data: un-augmented training images, no mixup (lam = 1), for dendrite phases.
+        for img, target in infinite_loader(clean_train_loader, None):
+            img = normalize(img.to(device, non_blocking=True))
+            target = target.to(device, non_blocking=True)
+            img = img.reshape(args.prefetch_factor, args.batch_size, *img.shape[1:])
+            target = target.reshape(args.prefetch_factor, args.batch_size)
+            yield from ((images, 1.0, t, t) for images, t in zip(img, target))
+
+    clean_gen = clean_batches() if clean_train_loader is not None else None
+
+    def next_batch():
+        if clean_gen is not None and pai_setup.in_dendrite_phase():
+            return next(clean_gen)
+        return next(gen)
+
     if args.pai:
         pai_images = PAIImages(args.log_dir)
     if args.pai and args.pai_init:
@@ -685,7 +718,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
     # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
     # the source run's best model (which PAI reloads at a switch) after its first step.
     best_model_pending = args.pai and bool(args.pai_resume)
-    for step, (images, lam, target1, target2) in zip(range(start_step + 1, total_steps + 1), gen):
+    for step in range(start_step + 1, total_steps + 1):
+        images, lam, target1, target2 = next_batch()
         # measure data loading time
         data_time.update(time.time() - end)
         if args.pai:
@@ -720,7 +754,10 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 # PAI's documented AMP pattern: a plain, unscaled backward in dendrite ('p')
                 # phases. PAI's dendrite correlation learning is not invariant to the loss scale.
                 # Each microbatch is its own optimizer step, so its loss is not divided.
-                loss.backward()
+                # --pai-p-loss-scale multiplies it instead: the batch-mean loss makes each
+                # sample's error ~1/batch, small enough that Adam's eps slows candidate learning
+                # at batch 256-1024. The PB score (a Pearson correlation) is scale-free.
+                (loss * args.pai_p_loss_scale).backward()
                 # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
                 # during the (unscaled) backward, so GradScaler is bypassed as PAI documents.
                 # Without loss scaling fp16 should not overflow; if it ever does, skip the update

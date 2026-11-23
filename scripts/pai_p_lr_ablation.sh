@@ -58,6 +58,16 @@ SCALES=${SCALES:-0.01 0.1 1 10 100}
 P_EPOCHS=${P_EPOCHS:-25}
 LAYER=${LAYER:-11}
 TARGET=${TARGET:-ln_mlp}
+# CLEAN=1: dendrite phase on un-augmented training images without mixup (--pai-p-clean-data)
+CLEAN=${CLEAN:-0}
+CLEAN_ARGS=()
+CLEAN_TAG=
+if [ "$CLEAN" = 1 ]; then CLEAN_ARGS=(--pai-p-clean-data); CLEAN_TAG=_clean; fi
+# P_LOSS_SCALE: --pai-p-loss-scale (default 1; e.g. the microbatch size BATCH/ACCUM, see main.py)
+# RUN_SUFFIX: appended to every run name, e.g. RUN_SUFFIX=_$USER to tell people's runs apart (default none)
+RUN_SUFFIX=${RUN_SUFFIX:-}
+P_LOSS_SCALE=${P_LOSS_SCALE:-1}
+if [ "$P_LOSS_SCALE" != 1 ]; then CLEAN_ARGS+=(--pai-p-loss-scale "$P_LOSS_SCALE"); CLEAN_TAG=${CLEAN_TAG}_ls${P_LOSS_SCALE}; fi
 WD=${WD:-0}
 GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
@@ -117,7 +127,7 @@ STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}${CLEAN_TAG}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}${RUN_SUFFIX}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
@@ -132,8 +142,8 @@ for K in $SCALES; do
         --lr "$LR" --wd "$WD" --workers "$WORKERS" \
         --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
-        "${SWITCH_ARGS[@]}" \
-        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, dendrites $MAX_DENDRITES, target $TARGET" \
+        "${SWITCH_ARGS[@]}" "${CLEAN_ARGS[@]}" \
+        --wandb-notes "p-phase LR ablation ($MODE${CLEAN_TAG}) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, dendrites $MAX_DENDRITES, target $TARGET" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
         FAILED+=("$K")   # e.g. K=100 diverging; keep going with the other scales
     fi
