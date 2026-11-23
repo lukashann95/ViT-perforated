@@ -717,10 +717,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
             # compute gradient
             if dendrite_phase:
-                # PAI's documented AMP pattern: a plain, unscaled backward in dendrite ('p')
-                # phases. PAI's dendrite correlation learning is not invariant to the loss scale.
-                # Each microbatch is its own optimizer step, so its loss is not divided.
-                loss.backward()
+                # PAI's documented AMP pattern: a plain backward without GradScaler in dendrite
+                # ('p') phases. PAI's dendrite correlation learning is not invariant to the loss
+                # scale. Each microbatch is its own optimizer step, so its loss is not divided;
+                # --pai-p-loss-scale multiplies it instead (default 1: the plain loss).
+                (loss * args.pai_p_loss_scale).backward()
                 # PAI computes dendrite gradients inside optimizer.step() from the errors recorded
                 # during the (unscaled) backward, so GradScaler is bypassed as PAI documents.
                 # Without loss scaling fp16 should not overflow; if it ever does, skip the update

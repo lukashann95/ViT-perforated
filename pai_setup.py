@@ -294,6 +294,13 @@ def add_arguments(parser):
                             '--log-steps = steps per epoch)')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
+    group.add_argument('--pai-p-loss-scale', default=1.0, type=float, metavar='S',
+                       help='multiply the loss by S in dendrite (p) phase backward passes (after Vamsi, '
+                            'branch pai-clean-pphase). The batch-mean loss makes the error each sample '
+                            'sends to a candidate ~1/microbatch, possibly small enough that AdamW\'s eps '
+                            'slows candidate learning; S = the microbatch size (batch/accum) restores '
+                            'per-sample magnitudes. The PB score is a correlation, so S changes learning, '
+                            'not the metric. Neuron phases are unaffected.')
 
 
 def check_args(parser, args):
@@ -316,6 +323,8 @@ def check_args(parser, args):
             parser.error('--pai-warmup is not supported with --pai-schedule cosine')
     elif args.pai_cosine_epochs is not None:
         parser.error('--pai-cosine-epochs applies only to --pai-schedule cosine')
+    if args.pai_p_loss_scale <= 0:
+        parser.error('--pai-p-loss-scale must be positive')
     if args.pai_resume and args.pai_init:
         parser.error('--pai-resume and --pai-init are mutually exclusive')
     if not all(0 <= i < args.num_layers for i in args.pai_layers):
