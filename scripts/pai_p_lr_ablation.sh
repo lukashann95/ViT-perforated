@@ -27,6 +27,10 @@
 #   the first; each later round is added by a fixed switch after another P_EPOCHS epochs. Every
 #   round gets its own P_EPOCHS-epoch cosine from K x PEAK_LR to 0 (PAI restarts the scheduler at
 #   each switch), so a run lasts MAX_DENDRITES x P_EPOCHS epochs;
+# CONTROL=1 (needs GD=1): the matching control arm (--pai-control): same wrapping, tracker,
+#   schedule, LR and length, but no dendrites. With MAX_DENDRITES > 1 it rebuilds the optimizer
+#   and scheduler where the GD arm adds each later round (--pai-control-restarts), so both arms
+#   get the same LR restarts. Run names carry "gdctrl";
 # WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
 #   with GD it applies to every weight matrix (the baseline used 1e-4);
 # P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp;
@@ -51,7 +55,14 @@ WORKERS=${WORKERS:-14}
 WD=${WD:-0}
 GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
+CONTROL=${CONTROL:-0}
 if [ "$GD" = 1 ]; then GD_ARGS=(--pai-gd); MODE=gd; else GD_ARGS=(); MODE=pb; fi
+if [ "$CONTROL" = 1 ]; then
+    if [ "$GD" != 1 ]; then echo "CONTROL=1 is set up as the control of a GD=1 run" >&2; exit 1; fi
+    GD_ARGS+=(--pai-control)
+    if [ "$MAX_DENDRITES" -gt 1 ]; then GD_ARGS+=(--pai-control-restarts $((MAX_DENDRITES - 1))); fi
+    MODE=gdctrl
+fi
 if [ "$MAX_DENDRITES" -lt 1 ]; then echo "MAX_DENDRITES must be >= 1" >&2; exit 1; fi
 if [ "$MAX_DENDRITES" -gt 1 ] && [ "$GD" != 1 ]; then
     # PB alternates p and n phases, so its schedule for several rounds is not this one.
