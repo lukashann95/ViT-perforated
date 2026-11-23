@@ -40,6 +40,9 @@
 #   each switch), so a run lasts MAX_DENDRITES x P_EPOCHS epochs;
 # WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
 #   with GD it applies to every weight matrix (the baseline used 1e-4);
+# TRAIN_FRACTION (default 0.2, the stratified subset with seed 42; 1 = all of ImageNet; run names
+#   carry _f<fraction>). P_EPOCHS counts epochs of that training set: 5 full-data epochs are as
+#   many steps as 25 subset epochs;
 # P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
 # default ln_mlp); LOGS (default ~/runs; Delta: /projects/bjto/$USER/runs); WANDB=0 to skip W&B.
 # DATA, GPU, WORKERS, WANDB_ENTITY / WANDB_PROJECT: see scripts/machine_env.sh
@@ -58,6 +61,13 @@ SCALES=${SCALES:-0.01 0.1 1 10 100}
 P_EPOCHS=${P_EPOCHS:-25}
 LAYER=${LAYER:-11}
 TARGET=${TARGET:-ln_mlp}
+TRAIN_FRACTION=${TRAIN_FRACTION:-0.2}
+# Training images per epoch, as main.py reports them (the subset rounds down per class).
+case "$TRAIN_FRACTION" in
+    0.2) TRAIN_IMAGES=256190 ;;
+    1)   TRAIN_IMAGES=1281167 ;;
+    *)   echo "TRAIN_FRACTION must be 0.2 or 1 (the training-set size of other fractions is not known here)" >&2; exit 1 ;;
+esac
 WD=${WD:-0}
 GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
@@ -109,15 +119,15 @@ COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit (no .git)")
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
 
-# One validation per epoch of the 20% subset (256,190 images), so PAI's epochs are real epochs;
+# One validation per epoch of the training set, so PAI's epochs are real epochs;
 # stop right after the P_EPOCHS-th validation, where the fixed switch ends the p phase.
-LOG_STEPS=$((256190 / BATCH))
+LOG_STEPS=$((TRAIN_IMAGES / BATCH))
 MAX_STEPS=$((TOTAL_EPOCHS * LOG_STEPS))
 STAMP=$(date +%Y%m%d_%H%M)
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
@@ -125,7 +135,7 @@ for K in $SCALES; do
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
     # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
     if ! "$PYTHON" -u main.py "$DATA" \
-        --gpu 0 --train-fraction 0.2 --subset-seed 42 \
+        --gpu 0 --train-fraction "$TRAIN_FRACTION" --subset-seed 42 \
         --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
         --epochs "$TOTAL_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
@@ -133,7 +143,7 @@ for K in $SCALES; do
         --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
         "${SWITCH_ARGS[@]}" \
-        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, dendrites $MAX_DENDRITES, target $TARGET" \
+        --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, train fraction $TRAIN_FRACTION, dendrites $MAX_DENDRITES, target $TARGET" \
         --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"; then
         FAILED+=("$K")   # e.g. K=100 diverging; keep going with the other scales
     fi
