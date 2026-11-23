@@ -30,7 +30,7 @@ def main():
     parser.add_argument('--patch-size', type=int, default=16)
     parser.add_argument('--input-resolution', type=int, default=224)
     parser.add_argument('--mlp-head', action='store_true')
-    parser.add_argument('--pai-target', default=None, choices=['mlp', 'ln_mlp', 'ln_fc1', 'fc1', 'fc2'],
+    parser.add_argument('--pai-target', default=None, choices=['mlp', 'ln_mlp', 'ln_fc1', 'fc1', 'fc2', 'qk', 'qkv'],
                         help='wrapping the checkpoint was saved with (default: detected)')
     args = parser.parse_args()
 

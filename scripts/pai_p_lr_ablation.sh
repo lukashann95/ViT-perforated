@@ -29,7 +29,7 @@
 #   each switch), so a run lasts MAX_DENDRITES x P_EPOCHS epochs;
 # WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
 #   with GD it applies to every weight matrix (the baseline used 1e-4);
-# P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp;
+# P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
 # default ln_mlp); DATA (ImageFolder root, default ~/data/imagenet);
 # LOGS (default ~/runs); GPU (default 0); WORKERS (default 14); WANDB=0 to skip W&B;
 # WANDB_ENTITY / WANDB_PROJECT (default IdlF26Group40 / ViT-perforated).

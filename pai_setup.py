@@ -19,6 +19,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 GPA = UPA = None
@@ -142,7 +143,94 @@ def _dendrites_in_fp32():
 # Submodule of torchvision's MLPBlock to perforate: Linear(D, 4D), GELU, Dropout, Linear(4D, D), Dropout.
 # 'ln_mlp' wraps the pre-norm ln_2 together with the whole MLP; 'ln_fc1' wraps ln_2 with the
 # first Linear only (dendrites on the 4D hidden units before the GELU).
-TARGETS = {'mlp': None, 'ln_mlp': None, 'ln_fc1': 0, 'fc1': 0, 'fc2': 3}
+# 'qk' and 'qkv' wrap the pre-norm ln_1 with the attention input projections (see SplitAttention).
+TARGETS = {'mlp': None, 'ln_mlp': None, 'ln_fc1': 0, 'fc1': 0, 'fc2': 3, 'qk': None, 'qkv': None}
+ATTENTION_TARGETS = ('qk', 'qkv')
+
+
+class SplitAttention(nn.Module):
+    """A block's ln_1 and nn.MultiheadAttention, with the fused in_proj split into Linears PAI can wrap.
+
+    nn.MultiheadAttention keeps q, k and v in one in_proj_weight that it passes to a functional
+    call, so there is no Linear for PAI to put dendrites on. Like ln_mlp/ln_fc1, the wrapped unit
+    includes the pre-norm (PAI's guidance), so the block's ln_1 moves in here and the block's own
+    ln_1 becomes Identity:
+      'qk':  self.qk = sequential([ln_1, Linear(D, 2D)]) for queries and keys (the only inputs of
+             the token-token scores); v = self.v(self.ln_1(x)) with self.ln_1 the same LayerNorm
+             object as self.qk's, so q, k and v keep one shared ln_1 as in the plain model.
+      'qkv': self.qkv = sequential([ln_1, Linear(D, 3D)]).
+    Same math as the modules it replaces (batch_first self-attention, called as
+    attention(x, x, x, need_weights=False) on the block input). out_proj is copied into a plain Linear.
+    """
+
+    def __init__(self, attention, ln_1, target, sequential):
+        super().__init__()
+        if target not in ATTENTION_TARGETS:
+            raise ValueError(f'SplitAttention target must be one of {ATTENTION_TARGETS}, not {target}')
+        if not (attention.batch_first and attention._qkv_same_embed_dim and attention.in_proj_bias is not None
+                and attention.bias_k is None and not attention.add_zero_attn):
+            raise ValueError('SplitAttention supports batch_first self-attention with in_proj bias only')
+        dim = attention.embed_dim
+        self.target, self.num_heads, self.dropout = target, attention.num_heads, attention.dropout
+
+        def linear(weight, bias):
+            layer = nn.Linear(weight.shape[1], weight.shape[0], device=weight.device, dtype=weight.dtype)
+            with torch.no_grad():
+                layer.weight.copy_(weight)
+                layer.bias.copy_(bias)
+            return layer
+
+        weight, bias = attention.in_proj_weight, attention.in_proj_bias
+        if target == 'qk':
+            self.qk = sequential([ln_1, linear(weight[:2 * dim], bias[:2 * dim])])
+            # Second reference to the LayerNorm inside self.qk, for the v path. Keep it registered
+            # after self.qk: PAI keeps the first path it finds for a shared module, and this order
+            # makes ln_1 part of the perforated block rather than a separately tracked module
+            # (both work; prints list ln_1 after qk although it runs first).
+            self.ln_1 = ln_1
+            self.v = linear(weight[2 * dim:], bias[2 * dim:])
+        else:
+            self.qkv = sequential([ln_1, linear(weight, bias)])
+        # A plain Linear: MultiheadAttention's out_proj is a Linear subclass
+        # (NonDynamicallyQuantizableLinear) that PAI's modules_to_track does not match, and PAI
+        # stops at optimizer setup on parameters that are neither tracked nor perforated.
+        self.out_proj = linear(attention.out_proj.weight, attention.out_proj.bias)
+
+    def forward(self, query, key, value, need_weights=False):
+        torch._assert(query is key and key is value and not need_weights,
+                      'SplitAttention does self-attention only, without attention weights')
+        batch, tokens, _ = query.shape
+        if self.target == 'qk':
+            qkv = torch.cat([self.qk(query), self.v(self.ln_1(query))], dim=-1)
+        else:
+            qkv = self.qkv(query)
+        # [batch, tokens, 3D] -> 3 x [batch, heads, tokens, head_dim], q/k/v in in_proj's order.
+        q, k, v = qkv.view(batch, tokens, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        return self.out_proj(out.transpose(1, 2).reshape(batch, tokens, -1)), None
+
+
+def wrap_target(block, target, sequential):
+    """Wrap one encoder block's --pai-target in `sequential` (GPA.PAISequential in perforate)."""
+    if target in ATTENTION_TARGETS:
+        # forward() computes self_attention(ln_1(x)); ln_1 moves into SplitAttention.
+        block.self_attention = SplitAttention(block.self_attention, block.ln_1, target, sequential)
+        block.ln_1 = nn.Identity()
+        return
+    mlp = block.mlp
+    index = TARGETS[target]
+    if target == 'ln_mlp':
+        # forward() computes mlp(ln_2(x)), so moving ln_2 inside the wrapper keeps the math.
+        block.mlp = sequential([block.ln_2, mlp])
+        block.ln_2 = nn.Identity()
+    elif target == 'ln_fc1':
+        # Likewise: mlp[0](ln_2(x)) with ln_2 moved into the wrapper around the first Linear.
+        mlp[0] = sequential([block.ln_2, mlp[0]])
+        block.ln_2 = nn.Identity()
+    elif index is None:
+        block.mlp = sequential([mlp])
+    else:
+        mlp[index] = sequential([mlp[index]])
 
 
 def add_arguments(parser):
@@ -152,7 +240,9 @@ def add_arguments(parser):
                             'Enables PAI; fine-tunes --pai-init if given, else trains from scratch.')
     group.add_argument('--pai-target', default='ln_mlp', choices=sorted(TARGETS),
                        help='perforate the MLP with its pre-norm ln_2 (default; PAI wants norm '
-                            'layers inside blocks), the whole MLP block, or only its first/second Linear')
+                            'layers inside blocks), the whole MLP block, only its first/second Linear, '
+                            'or the attention projections: qk (queries and keys, which set the attention '
+                            'pattern) or qkv (all three)')
     group.add_argument('--pai-gd', action='store_true',
                        help="train dendrites by gradient descent together with the neurons (PAI's "
                             "open-source mode) instead of Perforated Backpropagation's cascade-"
@@ -240,14 +330,24 @@ def plain_key(key, target):
     """Map one key of a perforated model's state_dict to the plain model's key.
 
     Returns None for PAI bookkeeping (tracker_string, dendrite_module.*, shape buffers). Neuron
-    weights only: dendrite weights, if any, are dropped too.
+    weights only: dendrite weights, if any, are dropped too. For 'qk' the q/k and v projections
+    map to the slices '<...>.in_proj_weight:qk' and ':v'; plain_state_dict concatenates them.
+    Two keys can map to the same plain key for a shared module ('qk': ln_1).
     """
     if key == 'tracker_string' or '.dendrite_module.' in key or key.endswith(
             ('.this_output_dimensions', '.this_node_index')):
         return None
     key = key.replace('.main_module.', '.')
     # The perforated target is wrapped as PAISequential([...]) -> '<module>.model.<i>.'.
-    if target == 'mlp':
+    if target in ATTENTION_TARGETS:
+        # SplitAttention: '<target>.model.0' is the block's ln_1 ('qk' also has it as
+        # self_attention.ln_1, the same tensors; plain_state_dict keeps one), '<target>.model.1'
+        # the in_proj rows.
+        key = re.sub(rf'\.self_attention\.(?:{target}\.model\.0|ln_1)\.', '.ln_1.', key)
+        suffix = ':qk' if target == 'qk' else ''
+        key = re.sub(rf'\.self_attention\.{target}\.model\.1\.(weight|bias)$', rf'.self_attention.in_proj_\1{suffix}', key)
+        key = re.sub(r'\.self_attention\.v\.(weight|bias)$', r'.self_attention.in_proj_\1:v', key)
+    elif target == 'mlp':
         key = re.sub(r'\.mlp\.model\.0\.', '.mlp.', key)
     elif target == 'ln_mlp':
         # PAISequential([ln_2, mlp]) replaced mlp, and ln_2 became Identity.
@@ -262,9 +362,31 @@ def plain_key(key, target):
     return key
 
 
+def check_shared_ln(model):
+    """Raise unless each 'qk' block's ln_1 is still one LayerNorm in its q/k and v paths.
+
+    SplitAttention holds the LayerNorm both inside the perforated self.qk and as self.ln_1; this
+    catches PAI copying either reference when it wraps modules or adds dendrites.
+    """
+    params = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if '.self_attention.' not in name or '.dendrite_module.' in name:
+            continue
+        plain = plain_key('.' + name, 'qk')
+        if plain and re.search(r'\.ln_1\.(weight|bias)$', plain):
+            params.setdefault(plain, []).append(param)
+    broken = [k for k, found in params.items() if len(found) != 2 or found[1] is not found[0]]
+    if broken:
+        raise RuntimeError(f"'qk' target: ln_1 is no longer shared between q/k and v: {broken}")
+
+
 def detect_target(state_dict):
     """The --pai-target a perforated state_dict was saved with."""
     keys = [k.replace('.main_module.', '.') for k in state_dict]
+    if any('.self_attention.qk.' in k for k in keys):
+        return 'qk'
+    if any('.self_attention.qkv.' in k for k in keys):
+        return 'qkv'
     if any('.mlp.0.model.1.' in k for k in keys):
         return 'ln_fc1'
     if any('.mlp.model.1.' in k for k in keys):
@@ -282,9 +404,26 @@ def plain_state_dict(state_dict, target=None):
         if new is None:
             continue
         if new in plain:
+            # The 'qk' target's shared ln_1 appears under two keys with the same tensor.
+            if torch.equal(plain[new], value):
+                continue
             raise ValueError(f'two perforated keys map to {new}')
         plain[new] = value
+    # 'qk': in_proj = [q; k] rows from the wrapped Linear(D, 2D), then v from Linear(D, D).
+    for key in [k for k in plain if k.endswith(':qk')]:
+        base = key.removesuffix(':qk')
+        plain[base] = torch.cat([plain.pop(key), plain.pop(base + ':v')])
     return plain
+
+
+def split_in_proj(plain):
+    """plain_state_dict's inverse for 'qk': add the ':qk' and ':v' slices of every in_proj."""
+    split = dict(plain)
+    for key, value in plain.items():
+        if key.endswith(('.self_attention.in_proj_weight', '.self_attention.in_proj_bias')):
+            dim = value.shape[0] // 3
+            split[key + ':qk'], split[key + ':v'] = value[:2 * dim], value[2 * dim:]
+    return split
 
 
 def tracker_string(checkpoint):
@@ -419,7 +558,7 @@ def write_best_model(model, args):
     directory as cwd.
     """
     source = _load_pai_file(resume_best_model_path(args.pai_resume))
-    best = plain_state_dict(source)
+    best = split_in_proj(plain_state_dict(source))
     state, copied = {}, 0
     for key, value in model.state_dict().items():
         # dendrite_module.parent_module.* is a second reference to the wrapped module's weights.
@@ -499,21 +638,7 @@ def perforate(model, args):
     if args.amp:
         _dendrites_in_fp32()
     for i in args.pai_layers:
-        block = model.encoder.layers[i]
-        mlp = block.mlp
-        index = TARGETS[args.pai_target]
-        if args.pai_target == 'ln_mlp':
-            # forward() computes mlp(ln_2(x)), so moving ln_2 inside the wrapper keeps the math.
-            block.mlp = GPA.PAISequential([block.ln_2, mlp])
-            block.ln_2 = nn.Identity()
-        elif args.pai_target == 'ln_fc1':
-            # Likewise: mlp[0](ln_2(x)) with ln_2 moved into the wrapper around the first Linear.
-            mlp[0] = GPA.PAISequential([block.ln_2, mlp[0]])
-            block.ln_2 = nn.Identity()
-        elif index is None:
-            block.mlp = GPA.PAISequential([mlp])
-        else:
-            mlp[index] = GPA.PAISequential([mlp[index]])
+        wrap_target(model.encoder.layers[i], args.pai_target, GPA.PAISequential)
 
     pc = GPA.pc
     if getattr(args, 'pai_gd', False):
@@ -563,6 +688,7 @@ def perforate(model, args):
 
     model = UPA.perforate_model(model, doing_pai=not args.pai_control, save_name='pai', maximizing_score=True)
     register_diagnostics(model)
+    check_shared_ln(model)
     return model
 
 
@@ -628,6 +754,7 @@ def add_score(model, acc1, args, device, force_switch=False):
             _pb_scores[f'pai/pb_best/{short_module_name(module.name)}'] = float(scores[-1])
     if restructured:
         register_diagnostics(model)
+        check_shared_ln(model)
     return model.to(device), bool(restructured), training_complete
 
 
