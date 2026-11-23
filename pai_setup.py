@@ -719,13 +719,15 @@ def setup_optimizer(model, args):
     GPA.pai_tracker.set_optimizer(torch.optim.AdamW)
     # Weight decay on weight matrices only, as main.py's baseline optimizer does: biases,
     # LayerNorm gains and the like get none. PAI keeps parameter groups (minus parameters that
-    # do not require grad in the current phase), so this holds in every phase, dendrites included.
+    # do not require grad in the current phase). Dendrite phases use no weight decay on the
+    # candidates (as the p-phase LR ablations ran them, with --wd 0); --wd is for neuron phases.
     named = list(model.named_parameters())
-    groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': args.weight_decay},
+    wd = 0.0 if in_dendrite_phase() else args.weight_decay
+    groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': wd},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
     lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
     opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
-                'weight_decay': args.weight_decay}
+                'weight_decay': wd}
     if args.pai_schedule == 'cosine':
         # Decays to 0 like main.py's baseline cosine (eta_min 0), but per validation, not per step.
         GPA.pai_tracker.set_scheduler(torch.optim.lr_scheduler.CosineAnnealingLR)
