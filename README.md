@@ -38,6 +38,9 @@ PAI runs refuse to start when more than one GPU is visible, even with `--gpu 0`.
 multi-GPU machine, pick one for training, e.g. `CUDA_VISIBLE_DEVICES=2 .venv/bin/python main.py ...`
 (`nvidia-smi` shows which are free). The smoke test picks the GPU with the most free memory itself.
 
+**3. Run.** [`scripts/README.md`](scripts/README.md) explains how to start baselines and PAI ablations on
+riddle, the 3090 PC and Delta, and where each machine keeps its repo, dataset and logs.
+
 The `main` branch of this repository aims to reproduce [Better plain ViT baselines for ImageNet-1k](https://arxiv.org/abs/2205.01580) in pytorch,
 in particular the 76.7% top-1 validation set accuracy of the Head: MLP → linear variant after 90 epochs. This variant is no inferior than the default,
 and personally [I have better experience with simpler prediction head](https://iclr-blogposts.github.io/2024/blog/alibi-mlm/). The changes I have made
