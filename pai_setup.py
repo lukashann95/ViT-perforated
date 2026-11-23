@@ -294,6 +294,20 @@ def add_arguments(parser):
                             '--log-steps = steps per epoch)')
     group.add_argument('--pai-candidate-grad-clipping', default=None, type=float,
                        help='clip candidate dendrite gradients to this norm (PAI default: off)')
+    group.add_argument('--pai-p-clean-data', action='store_true',
+                       help='in dendrite (p) phases, train on the same training images without '
+                            'augmentation (the validation transform: Resize 256, CenterCrop) and '
+                            'without mixup. RandAugment, Inception crop and mixup add noise to the '
+                            'error signal the candidates correlate with (locally, with main.py, PB '
+                            'scores reached 0.14 with clean data vs 0.02-0.03 with the augmented '
+                            'data at batch 64). Neuron phases keep the usual augmented pipeline.')
+    group.add_argument('--pai-p-loss-scale', default=1.0, type=float, metavar='S',
+                       help='multiply the loss by S for the backward pass of dendrite (p) phases. '
+                            'Candidates learn from the error at the module output, which the '
+                            'batch-mean loss makes ~1/batch per sample; at batch 256-1024 the '
+                            'candidate gradients are then small enough that Adam\'s eps throttles '
+                            'them. S = the microbatch size restores per-sample magnitudes. PB '
+                            'scores are Pearson correlations, so S changes learning, not the metric.')
 
 
 def check_args(parser, args):
