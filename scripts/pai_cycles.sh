@@ -22,7 +22,9 @@
 #   P_LR_SCALING (sqrt: dendrite LR = LR / sqrt(ACCUM); linear, none), WD (1e-4, the baseline's, neuron phases only;
 #   dendrite phases always use 0), P_EPOCHS (25), N_EPOCHS (50),
 #   MAX_DENDRITES (2), LAYERS ("9 10 11"), TARGET (ln_fc1), CLEAN (1), P_LOSS_SCALE (BATCH / ACCUM),
-#   RUN_SUFFIX (none), WANDB (1), WANDB_CKPTS (1: --wandb-checkpoints), LOGS (~/runs).
+#   RUN_SUFFIX (none), WANDB (1), WANDB_CKPTS (1: --wandb-checkpoints), LOGS (~/runs),
+#   CONTROL (0; 1: matched no-dendrite control, --pai-control: same LR resets every N_EPOCHS, no
+#   dendrite phases), EXTRA_ARGS (extra main.py flags, word-split).
 #   DATA, GPU, WORKERS, W&B and PAI credentials: see scripts/machine_env.sh.
 #
 # LR schedule: PAI rebuilds a cosine from the phase's starting LR at every phase, with one T_max for
@@ -45,6 +47,8 @@ CLEAN=${CLEAN:-1}
 P_LOSS_SCALE=${P_LOSS_SCALE:-$((BATCH / ACCUM))}
 RUN_SUFFIX=${RUN_SUFFIX:-}
 WANDB_CKPTS=${WANDB_CKPTS:-1}
+CONTROL=${CONTROL:-0}
+read -r -a EXTRA <<< "${EXTRA_ARGS:-}"
 if [ "$P_EPOCHS" -gt "$N_EPOCHS" ]; then echo "P_EPOCHS > N_EPOCHS: the cosine (T_max = N_EPOCHS) would rise again" >&2; exit 1; fi
 read -r -a LAYER_LIST <<< "$LAYERS"
 
@@ -80,11 +84,16 @@ fi
 # One validation per epoch of the 20% subset (256,190 images), so PAI's epochs are real epochs.
 LOG_STEPS=$((256190 / BATCH))
 TOTAL_EPOCHS=$((MAX_DENDRITES * (P_EPOCHS + N_EPOCHS) + 1))   # +1: PAI stops first
+if [ "$CONTROL" = 1 ]; then TOTAL_EPOCHS=$((MAX_DENDRITES * N_EPOCHS + 1)); fi
 MAX_STEPS=$((TOTAL_EPOCHS * LOG_STEPS))
 P_ARGS=()
 TAG=
-if [ "$CLEAN" = 1 ]; then P_ARGS+=(--pai-p-clean-data); TAG=_clean; fi
-if [ "$P_LOSS_SCALE" != 1 ]; then P_ARGS+=(--pai-p-loss-scale "$P_LOSS_SCALE"); TAG=${TAG}_ls${P_LOSS_SCALE}; fi
+if [ "$CONTROL" = 1 ]; then
+    P_ARGS+=(--pai-control); TAG=_ctrl
+else
+    if [ "$CLEAN" = 1 ]; then P_ARGS+=(--pai-p-clean-data); TAG=_clean; fi
+    if [ "$P_LOSS_SCALE" != 1 ]; then P_ARGS+=(--pai-p-loss-scale "$P_LOSS_SCALE"); TAG=${TAG}_ls${P_LOSS_SCALE}; fi
+fi
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then
     REPORT=(--report-to wandb)
@@ -104,7 +113,7 @@ CMD=("$PYTHON" -u main.py "$DATA"
     --pai-init "$CKPT" --pai-layers "${LAYER_LIST[@]}" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES"
     --pai-fixed-switch "$N_EPOCHS" --pai-p-epochs-to-switch "$P_EPOCHS"
     --pai-schedule cosine --pai-cosine-epochs "$N_EPOCHS" --pai-p-lr-scaling "$P_LR_SCALING"
-    "${P_ARGS[@]}"
+    "${P_ARGS[@]}" "${EXTRA[@]}"
     --wandb-notes "PB cycles$TAG from $CKPT: ${MAX_DENDRITES} x (p ${P_EPOCHS} + n ${N_EPOCHS} epochs), layers $LAYERS $TARGET, batch $BATCH (neurons; dendrites $((BATCH / ACCUM))), LR $LR (p-phase scaling $P_LR_SCALING), wd $WD, $COMMIT"
     --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}")
 
