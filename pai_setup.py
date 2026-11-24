@@ -262,6 +262,11 @@ def add_arguments(parser):
                             'Continues that run (step, tracker history, optimizer, LR scheduler) '
                             'with this run\'s --pai-layers/--pai-target/--pai-control, so PAI '
                             'decides the first switch itself.')
+    group.add_argument('--pai-new-schedule', action='store_true',
+                       help='with --resume: keep the weights, dendrites and tracker but build a fresh '
+                            'optimizer and LR scheduler from this run\'s --lr, --wd and '
+                            '--pai-cosine-epochs instead of restoring the saved ones (e.g. a new '
+                            'neuron phase after a dendrite-phase ablation)')
     group.add_argument('--pai-warmup', default=0, type=int, metavar='STEPS',
                        help='linear LR warmup from 0 to --lr over the first STEPS optimizer steps. '
                             'PAI owns the scheduler, so --warmup does not apply to PAI runs.')
@@ -333,6 +338,8 @@ def check_args(parser, args):
         parser.error('PAI runs support a single GPU only; pass --gpu 0')
     if args.resume and (args.pai_resume or args.pai_init):
         parser.error('--resume continues a PAI run; it excludes --pai-resume and --pai-init')
+    if args.pai_new_schedule and not args.resume:
+        parser.error('--pai-new-schedule applies only to --resume')
 
 
 def plain_key(key, target):
@@ -627,9 +634,13 @@ def archive_pre_switch(args):
 
 
 def restore_training(optimizer, scheduler, scaler, checkpoint, args):
-    """Restore optimizer, LR scheduler and GradScaler state; set the resume step."""
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    scheduler.load_state_dict(checkpoint['scheduler'])
+    """Restore optimizer, LR scheduler and GradScaler state; set the resume step.
+
+    With --pai-new-schedule the optimizer and scheduler stay as setup_optimizer built them.
+    """
+    if not getattr(args, 'pai_new_schedule', False):
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
     if args.amp and checkpoint.get('scaler'):
         scaler.load_state_dict(checkpoint['scaler'])
     args.start_step = checkpoint['step']
