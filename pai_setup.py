@@ -768,6 +768,8 @@ def add_score(model, acc1, args, device, force_switch=False):
     # phase, replaces its score lists with new empty ones, so hold on to the old lists.
     global _pb_scores
     best_scores = GPA.pai_tracker.member_vars.get('best_scores') if in_dendrite_phase() else None
+    if best_scores is not None:
+        save_neuron_pb_scores()
     model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
         100 * acc1, model, force_switch=force_switch)
     _pb_scores = {}
@@ -778,6 +780,29 @@ def add_score(model, acc1, args, device, force_switch=False):
         register_diagnostics(model)
         check_shared_ln(model)
     return model.to(device), bool(restructured), training_complete
+
+
+_neuron_dump_count = 0
+
+
+def save_neuron_pb_scores(folder='pai_neurons'):
+    """Save every neuron's running-best |Pearson| (PB score) per perforated module to
+    <log dir>/pai_neurons/val<k>.npz, before this dendrite-phase validation (PAI's module score,
+    pai/pb_best/<module>, is the max over neurons of the same values after it). Never raises:
+    a failure here must not stop a run."""
+    global _neuron_dump_count
+    try:
+        import numpy as np
+        arrays = {}
+        for module in GPA.pai_tracker.neuron_module_vector:
+            values = module.dendrite_module.dendrite_values[0]
+            arrays[short_module_name(module.name)] = (
+                values.best_pearson_correlation.detach().float().abs().flatten().cpu().numpy())
+        _neuron_dump_count += 1
+        os.makedirs(folder, exist_ok=True)
+        np.savez(os.path.join(folder, f'val{_neuron_dump_count}.npz'), **arrays)
+    except Exception as e:  # noqa: BLE001
+        print(f"=> could not save per-neuron PB scores: {e!r}")
 
 
 def warmup_lr(optimizer, args, step):
