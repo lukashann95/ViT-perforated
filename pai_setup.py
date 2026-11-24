@@ -289,6 +289,9 @@ def add_arguments(parser):
                        help='with --accum-freq k, dendrite (p) phases step once per microbatch of '
                             'batch/k, so scale their LR by 1/k (linear) or 1/sqrt(k) (sqrt). '
                             'none keeps --lr, as PAI runs did before this option.')
+    group.add_argument('--pai-p-lr', default=None, type=float, metavar='LR',
+                       help='LR of dendrite (p) phases; overrides --lr and --pai-p-lr-scaling there '
+                            '(e.g. a low neuron-phase --lr with the p-phase LR the ablations chose)')
     group.add_argument('--pai-cosine-epochs', default=None, type=int, metavar='N',
                        help='T_max of --pai-schedule cosine, in validations (one per epoch with '
                             '--log-steps = steps per epoch)')
@@ -726,6 +729,8 @@ def setup_optimizer(model, args):
     groups = [{'params': [p for n, p in named if decays(n, p)], 'weight_decay': wd},
               {'params': [p for n, p in named if not decays(n, p)], 'weight_decay': 0.0}]
     lr = args.lr * p_lr_factor(args) if in_dendrite_phase() else args.lr
+    if in_dendrite_phase() and getattr(args, 'pai_p_lr', None) is not None:
+        lr = args.pai_p_lr
     opt_args = {'params': groups, 'lr': lr, 'betas': (args.beta1, args.beta2),
                 'weight_decay': wd}
     if args.pai_schedule == 'cosine':
