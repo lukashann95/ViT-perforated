@@ -38,8 +38,8 @@
 #   the first; each later round is added by a fixed switch after another P_EPOCHS epochs. Every
 #   round gets its own P_EPOCHS-epoch cosine from K x PEAK_LR to 0 (PAI restarts the scheduler at
 #   each switch), so a run lasts MAX_DENDRITES x P_EPOCHS epochs;
-# WD (default 0): weight decay. With PB the neurons are frozen, so 0 only affects candidates;
-#   with GD it applies to every weight matrix (the baseline used 1e-4);
+# WD (default 0): weight decay. With PB it has no effect: neurons are frozen and dendrite phases never
+#   decay the candidates (pai_setup.setup_optimizer); with GD it applies to every weight matrix (the baseline used 1e-4);
 # TRAIN_FRACTION (default 0.2, the stratified subset with seed 42; 1 = all of ImageNet; run names
 #   carry _f<fraction>). P_EPOCHS counts epochs of that training set: 5 full-data epochs are as
 #   many steps as 25 subset epochs;
@@ -151,7 +151,7 @@ for K in $SCALES; do
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
          "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $COMMIT"
     # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
-    # Neurons are frozen in the p phase, so --wd 0 means no weight decay on the candidates.
+    # Dendrite (p) phases use no weight decay on the candidates, whatever --wd (pai_setup.setup_optimizer).
     if ! "$PYTHON" -u main.py "$DATA" \
         --gpu 0 --train-fraction "$TRAIN_FRACTION" --subset-seed 42 \
         --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
