@@ -12,7 +12,7 @@
 #   (downloads checkpoint-<run>:pre_switch), LAYERS ("9 10 11"), PAI_TARGET (ln_mlp), CONTROL (0),
 #   ACCUM (4), LR (1e-3), MAX_DENDRITES (2), PAI_PATIENCE (5), PAI_N_EPOCHS_TO_SWITCH (15),
 #   EPOCHS (350, total including the source run's epochs; a cap, PAI ends the run itself),
-#   EXTRA_ARGS (extra main.py flags), RUN_SUFFIX, WANDB_CKPTS (1), LOGS (~/runs).
+#   EXTRA_ARGS (extra main.py flags), HISTORY_FROM_SOURCE (0; 1: --wandb-history-from), RUN_SUFFIX, WANDB_CKPTS (1), LOGS (~/runs).
 #   DATA, GPU, WORKERS, credentials: scripts/machine_env.sh.
 set -euo pipefail
 LAYERS=${LAYERS:-9 10 11}
@@ -64,6 +64,9 @@ fi
 PAI_ARGS=(--pai-layers "${LAYER_LIST[@]}")
 TAG=$(IFS=-; echo "${LAYER_LIST[*]}")
 if [ "$CONTROL" = 1 ]; then PAI_ARGS+=(--pai-control); TAG=${TAG}_control; fi
+# HISTORY_FROM_SOURCE=1: copy the source run's W&B history into this run (it must be in WANDB_PROJECT).
+HISTORY=()
+[ "${HISTORY_FROM_SOURCE:-0}" = 1 ] && HISTORY=(--wandb-history-from "$SRC_RUN")
 REPORT=(--report-to wandb)
 [ "$WANDB_CKPTS" = 1 ] && REPORT+=(--wandb-checkpoints)
 COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit")
@@ -75,7 +78,7 @@ CMD=("$PYTHON" -u main.py "$DATA"
     --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16
     --batch-size 1024 --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop
     --epochs "$EPOCHS" --lr "$LR" --log-steps 250 --workers "$WORKERS"
-    --pai-resume "$RESUME" --wandb-history-from "$SRC_RUN"
+    --pai-resume "$RESUME" "${HISTORY[@]}"
     "${PAI_ARGS[@]}" --pai-target "$PAI_TARGET" --max-dendrites "$MAX_DENDRITES"
     --pai-patience "$PAI_PATIENCE" --pai-n-epochs-to-switch "$PAI_N_EPOCHS_TO_SWITCH"
     "${EXTRA[@]}"
