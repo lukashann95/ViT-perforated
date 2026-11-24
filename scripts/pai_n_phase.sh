@@ -9,7 +9,7 @@
 #   forgeq-gpu 1 env GPU=1 SRC=<p-phase run name> LR=1e-4 ~/ViT-perforated/scripts/pai_n_phase.sh
 # Env: SRC (required unless CONTROL=1): the p-phase run, read from $LOGS/$SRC/checkpoints/checkpoint.pth.tar;
 # LR (required); N_EPOCHS (default 10, epochs of the training set); WD (default 1e-4, the baseline's
-# at batch 1024); BATCH (1024), ACCUM (4), LAYER (11), TARGET (ln_mlp), TRAIN_FRACTION (1) must
+# at batch 1024); BATCH (1024), ACCUM (4), LAYER (11; several blocks space-separated), TARGET (ln_mlp), TRAIN_FRACTION (1) must
 # match the p-phase run. UPLOAD_CKPTS=1 uploads checkpoints (--wandb-checkpoints); WANDB=0 skips W&B.
 # LOGS, DATA, GPU, WORKERS: as in pai_p_lr_ablation.sh.
 set -euo pipefail
@@ -25,6 +25,8 @@ WD=${WD:-1e-4}
 BATCH=${BATCH:-1024}
 ACCUM=${ACCUM:-4}
 LAYER=${LAYER:-11}
+read -ra LAYERS <<< "$LAYER"
+LAYER_TAG=$(IFS=-; echo "${LAYERS[*]}")
 TARGET=${TARGET:-ln_mlp}
 TRAIN_FRACTION=${TRAIN_FRACTION:-1}
 case "$TRAIN_FRACTION" in
@@ -53,7 +55,7 @@ if [ "$CONTROL" = 1 ]; then
     # --pai-init starts at step 0 and validates the loaded model first.
     START_STEP=0
     INIT_ARGS=(--pai-init "$CKPT" --pai-control)
-    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)
+    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)
     SRC="control from $CKPT"
 else
     START_STEP=$("$PYTHON" -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=True)['step'])" "$CKPT")
@@ -71,7 +73,7 @@ echo "=== $RUN_NAME: n phase from $CKPT (step $START_STEP), LR $LR -> 0 over $N_
     --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
     --epochs $((START_EPOCHS + N_EPOCHS)) --max-steps $((N_EPOCHS * LOG_STEPS)) --log-steps "$LOG_STEPS" \
     --lr "$LR" --wd "$WD" --workers "$WORKERS" \
-    "${INIT_ARGS[@]}" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites 1 \
+    "${INIT_ARGS[@]}" --pai-layers "${LAYERS[@]}" --pai-target "$TARGET" --max-dendrites 1 \
     --pai-schedule cosine --pai-cosine-epochs "$N_EPOCHS" --pai-p-lr-scaling linear --pai-fixed-switch 1000 \
     --wandb-notes "n phase after $SRC: $N_EPOCHS epochs, LR $LR -> 0, wd $WD, augmented, $COMMIT" \
     --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"

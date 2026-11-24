@@ -49,7 +49,9 @@
 #   the microbatch size BATCH/ACCUM gives per-sample error magnitudes. Run names carry _ls<S> unless 1.
 # UPLOAD_CKPTS=1 uploads checkpoints as W&B artifact checkpoint-<run name> (--wandb-checkpoints);
 #   its 'last' is the state after the final validation, where the switch has installed the dendrite.
-# P_EPOCHS (default 25); LAYER (default 11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
+# STAMP (default: the start time, YYYYmmdd_HHMM): the run names' suffix, so a later job (e.g.
+#   scripts/pai_n_phase.sh SRC=...) can name the run in advance;
+# P_EPOCHS (default 25); LAYER (default 11; several blocks space-separated, e.g. "9 10 11", named l9-10-11); TARGET (--pai-target: ln_mlp, ln_fc1, fc1, fc2, mlp, qk, qkv;
 # default ln_mlp); LOGS (default ~/runs; Delta: /projects/bjto/$USER/runs); WANDB=0 to skip W&B.
 # DATA, GPU, WORKERS, WANDB_ENTITY / WANDB_PROJECT: see scripts/machine_env.sh
 # (defaults ~/data/imagenet, 0, CPU cores - 1, IdlF26Group40 / ViT-perforated; Delta unpacks the
@@ -66,6 +68,8 @@ ACCUM=${ACCUM:-1}
 SCALES=${SCALES:-0.01 0.1 1 10 100}
 P_EPOCHS=${P_EPOCHS:-25}
 LAYER=${LAYER:-11}
+read -ra LAYERS <<< "$LAYER"
+LAYER_TAG=$(IFS=-; echo "${LAYERS[*]}")
 TARGET=${TARGET:-ln_mlp}
 TRAIN_FRACTION=${TRAIN_FRACTION:-0.2}
 # Training images per epoch, as main.py reports them (the subset rounds down per class).
@@ -141,11 +145,11 @@ fi
 # stop right after the P_EPOCHS-th validation, where the fixed switch ends the p phase.
 LOG_STEPS=$((TRAIN_IMAGES / BATCH))
 MAX_STEPS=$((TOTAL_EPOCHS * LOG_STEPS))
-STAMP=$(date +%Y%m%d_%H%M)
+STAMP=${STAMP:-$(date +%Y%m%d_%H%M)}
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
-    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}${CLEAN_TAG}${LS_TAG}_k${K}_${STAMP}
+    RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}${CLEAN_TAG}${LS_TAG}_k${K}_${STAMP}
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
@@ -158,7 +162,7 @@ for K in $SCALES; do
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
         --epochs "$TOTAL_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
         --lr "$LR" --wd "$WD" --workers "$WORKERS" \
-        --pai-init "$CKPT" --pai-layers "$LAYER" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
+        --pai-init "$CKPT" --pai-layers "${LAYERS[@]}" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
         "${SWITCH_ARGS[@]}" "${CLEAN_ARGS[@]}" "${LS_ARGS[@]}" \
         --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, train fraction $TRAIN_FRACTION, clean $CLEAN, p loss scale $P_LOSS_SCALE, dendrites $MAX_DENDRITES, target $TARGET" \
