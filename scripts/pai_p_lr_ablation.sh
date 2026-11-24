@@ -109,28 +109,14 @@ REPO=${REPO:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}" && pwd)}
 test -f "$REPO/scripts/machine_env.sh" || { echo "No $REPO/scripts/machine_env.sh (with sbatch, submit from the repo root)" >&2; exit 1; }
 # Sets DATA, WORKERS, PYTHON, the PAI credentials, the W&B entity/project and the visible GPU.
 source "$REPO/scripts/machine_env.sh"
+source "$REPO/scripts/wandb_ckpt.sh"
 LOGS=${LOGS:-$HOME/runs}
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
 cd "$REPO"
 if [ -z "${CKPT:-}" ]; then
     CKPT=$LOGS/ckpts/$CKPT_WANDB/checkpoint.pth.tar
-    if [ ! -r "$CKPT" ]; then
-        # Download next to it and rename, so parallel jobs never read a half-written file.
-        mkdir -p "$(dirname "$CKPT")"
-        TMP_DL=$(mktemp -d "$(dirname "$CKPT")/.download.XXXXXX")
-        "$PYTHON" - "$CKPT_WANDB" "$TMP_DL" <<'PY'
-import os, sys, wandb
-run, dest = sys.argv[1:]
-path = f"{os.environ['WANDB_ENTITY']}/{os.environ['WANDB_PROJECT']}/checkpoint-{run}:last"
-artifact = wandb.Api(api_key=os.environ.get('WANDB_API_TOKEN') or None).artifact(path, type='model')
-artifact.download(dest)
-print(f"=> downloaded {path} (step {artifact.metadata.get('step')}, "
-      f"acc@1 {artifact.metadata.get('acc1')}) to {dest}")
-PY
-        mv -f "$TMP_DL/checkpoint.pth.tar" "$CKPT"
-        rm -rf "$TMP_DL"
-    fi
+    fetch_wandb_ckpt "$CKPT_WANDB" "$CKPT"
 fi
 test -r "$CKPT" || { echo "cannot read CKPT=$CKPT" >&2; exit 1; }
 COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit (no .git)")

@@ -5,9 +5,12 @@
 # The saved optimizer and schedule are replaced (--pai-new-schedule); judge by val/acc@1.
 # CONTROL=1 is the no-dendrite control: CKPT=<plain main.py checkpoint> (the one the p-phase run
 # perforated, so the same neurons) with the same n phase under --pai-control, from step 0.
+# CKPT_WANDB=<run name> instead of CKPT uses $LOGS/ckpts/<run name>/checkpoint.pth.tar, downloading
+# that run's W&B artifact checkpoint-<run name>:last there if missing.
 # As one task-spooler job on riddle GPU 1:
 #   forgeq-gpu 1 env GPU=1 SRC=<p-phase run name> LR=1e-4 ~/ViT-perforated/scripts/pai_n_phase.sh
-# Env: SRC (required unless CONTROL=1): the p-phase run, read from $LOGS/$SRC/checkpoints/checkpoint.pth.tar;
+# Env: SRC (required unless CONTROL=1): the p-phase run, read from $LOGS/$SRC/checkpoints/checkpoint.pth.tar
+# (downloaded from W&B artifact checkpoint-$SRC:last if missing: p-phase runs with UPLOAD_CKPTS=1);
 # LR (required); N_EPOCHS (default 10, epochs of the training set); WD (default 1e-4, the baseline's
 # at batch 1024); BATCH (1024), ACCUM (4), LAYER (11; several blocks space-separated), TARGET (ln_mlp), TRAIN_FRACTION (1) must
 # match the p-phase run. UPLOAD_CKPTS=1 uploads checkpoints (--wandb-checkpoints); WANDB=0 skips W&B.
@@ -15,7 +18,7 @@
 set -euo pipefail
 CONTROL=${CONTROL:-0}
 if [ "$CONTROL" = 1 ]; then
-    : "${CKPT:?set CKPT to the plain checkpoint the p-phase run started from}"
+    [ -n "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "set CKPT to the plain checkpoint the p-phase run started from, or CKPT_WANDB to its run name" >&2; exit 1; }
 else
     : "${SRC:?set SRC to the p-phase run name}"
 fi
@@ -37,11 +40,18 @@ esac
 
 REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 source "$REPO/scripts/machine_env.sh"
+source "$REPO/scripts/wandb_ckpt.sh"
 LOGS=${LOGS:-$HOME/runs}
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
 cd "$REPO"
-[ "$CONTROL" = 1 ] || CKPT=$LOGS/$SRC/checkpoints/checkpoint.pth.tar
+if [ "$CONTROL" != 1 ]; then
+    CKPT=$LOGS/$SRC/checkpoints/checkpoint.pth.tar
+    fetch_wandb_ckpt "$SRC" "$CKPT"
+elif [ -z "${CKPT:-}" ]; then
+    CKPT=$LOGS/ckpts/$CKPT_WANDB/checkpoint.pth.tar
+    fetch_wandb_ckpt "$CKPT_WANDB" "$CKPT"
+fi
 test -r "$CKPT" || { echo "cannot read $CKPT" >&2; exit 1; }
 COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit")
 REPORT=()
