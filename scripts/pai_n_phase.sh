@@ -14,6 +14,8 @@
 # LR (required); N_EPOCHS (default 10, epochs of the training set); WD (default 1e-4, the baseline's
 # at batch 1024); BATCH (1024), ACCUM (4), LAYER (11; several blocks space-separated), TARGET (ln_mlp), TRAIN_FRACTION (1) must
 # match the p-phase run. UPLOAD_CKPTS=1 uploads checkpoints (--wandb-checkpoints); WANDB=0 skips W&B.
+# CLEAN=1 trains the n phase without augmentation, as pai_p_lr_ablation.sh's CLEAN=1 does for dendrite phases
+# (no MixUp, no RandAugment, the crop takes the whole image; flip and aspect ratio remain); names carry _n<N>_clean.
 # RUN_SUFFIX (e.g. _rep2) is appended to the run name: needed to repeat a dendrite n phase from the same SRC,
 # whose name is otherwise identical (same log folder and W&B run).
 # LOGS, DATA, GPU, WORKERS: as in pai_p_lr_ablation.sh.
@@ -34,6 +36,12 @@ read -ra LAYERS <<< "$LAYER"
 LAYER_TAG=$(IFS=-; echo "${LAYERS[*]}")
 TARGET=${TARGET:-ln_mlp}
 TRAIN_FRACTION=${TRAIN_FRACTION:-1}
+CLEAN=${CLEAN:-0}
+if [ "$CLEAN" = 1 ]; then
+    CLEAN_ARGS=(--mixup-alpha 0 --no-randaug --lower-scale 1 --upper-scale 1); CLEAN_TAG=_clean
+else
+    CLEAN_ARGS=(); CLEAN_TAG=
+fi
 case "$TRAIN_FRACTION" in
     0.2) TRAIN_IMAGES=256190 ;;
     1)   TRAIN_IMAGES=1281167 ;;
@@ -67,12 +75,12 @@ if [ "$CONTROL" = 1 ]; then
     # --pai-init starts at step 0 and validates the loaded model first.
     START_STEP=0
     INIT_ARGS=(--pai-init "$CKPT" --pai-control)
-    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)${RUN_SUFFIX:-}
+    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}${CLEAN_TAG}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)${RUN_SUFFIX:-}
     SRC="control from $CKPT"
 else
     START_STEP=$("$PYTHON" -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=True)['step'])" "$CKPT")
     INIT_ARGS=(--resume "$CKPT" --pai-new-schedule)
-    RUN_NAME=${SRC}_n${N_EPOCHS}_lr${LR}_wd${WD}${RUN_SUFFIX:-}
+    RUN_NAME=${SRC}_n${N_EPOCHS}${CLEAN_TAG}_lr${LR}_wd${WD}${RUN_SUFFIX:-}
 fi
 START_EPOCHS=$(( (START_STEP + LOG_STEPS / 2) / LOG_STEPS ))
 export WANDB_DIR=$LOGS/$RUN_NAME
@@ -84,8 +92,8 @@ echo "=== $RUN_NAME: n phase from $CKPT (step $START_STEP), LR $LR -> 0 over $N_
     --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
     --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
     --epochs $((START_EPOCHS + N_EPOCHS)) --max-steps $((N_EPOCHS * LOG_STEPS)) --log-steps "$LOG_STEPS" \
-    --lr "$LR" --wd "$WD" --workers "$WORKERS" \
+    --lr "$LR" --wd "$WD" --workers "$WORKERS" "${CLEAN_ARGS[@]}" \
     "${INIT_ARGS[@]}" --pai-layers "${LAYERS[@]}" --pai-target "$TARGET" --max-dendrites 1 \
     --pai-schedule cosine --pai-cosine-epochs "$N_EPOCHS" --pai-p-lr-scaling linear --pai-fixed-switch 1000 \
-    --wandb-notes "n phase after $SRC: $N_EPOCHS epochs, LR $LR -> 0, wd $WD, augmented, $COMMIT" \
+    --wandb-notes "n phase after $SRC: $N_EPOCHS epochs, LR $LR -> 0, wd $WD, $([ "$CLEAN" = 1 ] && echo clean || echo augmented), $COMMIT" \
     --logs "$LOGS" --name "$RUN_NAME" "${REPORT[@]}" 2>&1 | tee "$WANDB_DIR/train.log"
