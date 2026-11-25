@@ -14,6 +14,8 @@
 # LR (required); N_EPOCHS (default 10, epochs of the training set); WD (default 1e-4, the baseline's
 # at batch 1024); BATCH (1024), ACCUM (4), LAYER (11; several blocks space-separated), TARGET (ln_mlp), TRAIN_FRACTION (1) must
 # match the p-phase run. UPLOAD_CKPTS=1 uploads checkpoints (--wandb-checkpoints); WANDB=0 skips W&B.
+# RUN_SUFFIX (e.g. _rep2) is appended to the run name: needed to repeat a dendrite n phase from the same SRC,
+# whose name is otherwise identical (same log folder and W&B run).
 # LOGS, DATA, GPU, WORKERS: as in pai_p_lr_ablation.sh.
 set -euo pipefail
 CONTROL=${CONTROL:-0}
@@ -65,12 +67,12 @@ if [ "$CONTROL" = 1 ]; then
     # --pai-init starts at step 0 and validates the loaded model first.
     START_STEP=0
     INIT_ARGS=(--pai-init "$CKPT" --pai-control)
-    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)
+    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)${RUN_SUFFIX:-}
     SRC="control from $CKPT"
 else
     START_STEP=$("$PYTHON" -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=True)['step'])" "$CKPT")
     INIT_ARGS=(--resume "$CKPT" --pai-new-schedule)
-    RUN_NAME=${SRC}_n${N_EPOCHS}_lr${LR}_wd${WD}
+    RUN_NAME=${SRC}_n${N_EPOCHS}_lr${LR}_wd${WD}${RUN_SUFFIX:-}
 fi
 START_EPOCHS=$(( (START_STEP + LOG_STEPS / 2) / LOG_STEPS ))
 export WANDB_DIR=$LOGS/$RUN_NAME
