@@ -768,8 +768,7 @@ def add_score(model, acc1, args, device, force_switch=False):
     # phase, replaces its score lists with new empty ones, so hold on to the old lists.
     global _pb_scores
     best_scores = GPA.pai_tracker.member_vars.get('best_scores') if in_dendrite_phase() else None
-    if best_scores is not None:
-        save_neuron_pb_scores()
+    _hook_neuron_pb_scores()
     model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
         100 * acc1, model, force_switch=force_switch)
     _pb_scores = {}
@@ -785,11 +784,34 @@ def add_score(model, acc1, args, device, force_switch=False):
 _neuron_dump_count = 0
 
 
+def _hook_neuron_pb_scores():
+    """Make PAI save per-neuron PB scores right after it updates them at each dendrite-phase
+    validation. add_validation_score calls TPB.update_pb_scores (looked up on the module at call
+    time) before it decides on a switch, and a switch discards the per-neuron values, so wrapping
+    it is the only place that sees the last dendrite-phase epoch. Never raises."""
+    try:
+        from perforatedbp import tracker_pbp as TPB
+        if getattr(TPB.update_pb_scores, '_dumps_neurons', False):
+            return
+        original = TPB.update_pb_scores
+
+        def update_pb_scores(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if in_dendrite_phase():
+                save_neuron_pb_scores()
+            return result
+
+        update_pb_scores._dumps_neurons = True
+        TPB.update_pb_scores = update_pb_scores
+    except Exception as e:  # noqa: BLE001
+        print(f"=> could not hook per-neuron PB scores: {e!r}")
+
+
 def save_neuron_pb_scores(folder='pai_neurons'):
     """Save every neuron's running-best |Pearson| (PB score) per perforated module to
-    <log dir>/pai_neurons/val<k>.npz, before this dendrite-phase validation (PAI's module score,
-    pai/pb_best/<module>, is the max over neurons of the same values after it). Never raises:
-    a failure here must not stop a run."""
+    <log dir>/pai_neurons/val<k>.npz. Called from _hook_neuron_pb_scores after PAI's update at
+    the k-th dendrite-phase validation, so PAI's module score (pai/pb_best/<module>) is the max
+    over neurons of the saved values. Never raises: a failure here must not stop a run."""
     global _neuron_dump_count
     try:
         import numpy as np
