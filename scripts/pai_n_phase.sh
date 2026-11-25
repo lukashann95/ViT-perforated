@@ -82,6 +82,9 @@ else
     INIT_ARGS=(--resume "$CKPT" --pai-new-schedule)
     RUN_NAME=${SRC}_n${N_EPOCHS}${CLEAN_TAG}_lr${LR}_wd${WD}${RUN_SUFFIX:-}
 fi
+# W&B rejects run IDs (= our run names) over 128 characters: compress an all-blocks list, else stop.
+if [ ${#RUN_NAME} -gt 128 ]; then RUN_NAME=${RUN_NAME//l0-1-2-3-4-5-6-7-8-9-10-11_/l0to11_}; fi
+if [ ${#RUN_NAME} -gt 128 ]; then echo "run name is ${#RUN_NAME} characters, W&B allows 128: $RUN_NAME" >&2; exit 1; fi
 START_EPOCHS=$(( (START_STEP + LOG_STEPS / 2) / LOG_STEPS ))
 export WANDB_DIR=$LOGS/$RUN_NAME
 mkdir -p "$WANDB_DIR"
