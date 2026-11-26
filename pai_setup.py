@@ -705,6 +705,11 @@ def perforate(model, args):
         pc.set_n_fixed_switch_num(args.pai_fixed_switch)
         pc.set_first_fixed_switch_num(args.pai_fixed_switch)
         pc.set_p_fixed_switch_num(args.pai_p_epochs_to_switch)
+    if args.pai_init:
+        # PAI caps a dendrite phase at the length of the neuron phase before it (cap_at_n). A
+        # --pai-init run switches at its first validation, after a 0-epoch neuron phase, so the
+        # cap would end the first dendrite phase after one validation, before candidates converge.
+        pc.set_cap_at_n(False)
     if args.pai_initial_correlation_batches is not None:
         pc.set_initial_correlation_batches(args.pai_initial_correlation_batches)
     if args.pai_candidate_grad_clipping is not None:
