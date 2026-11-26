@@ -157,7 +157,7 @@ parser.add_argument('--name', default=None, type=str,
 parser.add_argument("--report-to", default='', type=str,
                     help="Options are ['wandb']")
 parser.add_argument("--wandb-history-from", default='', type=str, metavar='RUN_ID',
-                    help="W&B run (same entity/project) whose logged scalars and images up to the resume step "
+                    help="W&B run (same entity; same project, or <project>/<run>) whose logged scalars and images up to the resume step "
                          "are copied into this run first, e.g. the run a --pai-resume checkpoint "
                          "came from. W&B's own run forking is a private preview feature.")
 parser.add_argument("--wandb-name", default='', type=str, metavar='RUN_ID',
@@ -183,7 +183,9 @@ def copy_wandb_history(run_id, last_step, steps_per_epoch):
     before it was logged) get one from this run's steps_per_epoch, which assumes the source run
     used the same batch size.
     """
-    source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{wandb.run.project}/{run_id}")
+    # run_id may name another project of the same entity: <project>/<run>.
+    path = run_id if '/' in run_id else f"{wandb.run.project}/{run_id}"
+    source = wandb.Api(timeout=120).run(f"{wandb.run.entity}/{path}")
     rows = images = 0
     with tempfile.TemporaryDirectory() as media_dir:
         for row in source.scan_history(page_size=1000):
@@ -555,7 +557,7 @@ def main_worker(gpu, args):
 
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
     if pai_resume is not None:
-        pai_setup.restore_training(optimizer, scheduler, scaler, pai_resume, args)
+        pai_setup.restore_training(optimizer, scheduler, scaler, pai_resume, args, original_model)
 
     # optionally resume from a checkpoint (PAI runs resume above)
     if args.resume and not args.pai:

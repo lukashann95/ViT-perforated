@@ -617,14 +617,54 @@ def archive_pre_switch(args):
             os.replace(dst + '.tmp', dst)
 
 
-def restore_training(optimizer, scheduler, scaler, checkpoint, args):
+def restore_training(optimizer, scheduler, scaler, checkpoint, args, model=None):
     """Restore optimizer, LR scheduler and GradScaler state; set the resume step."""
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    saved = checkpoint['optimizer']
+    if len(saved['param_groups']) == 1 and len(optimizer.param_groups) > 1 and model is not None:
+        saved = split_single_group(optimizer, saved, model)
+    optimizer.load_state_dict(saved)
     scheduler.load_state_dict(checkpoint['scheduler'])
+    # Per-group scheduler lists from a one-group checkpoint: repeat them for every group.
+    for key in ('min_lrs', '_last_lr', 'base_lrs'):
+        values = getattr(scheduler, key, None)
+        if isinstance(values, list) and len(values) == 1 < len(optimizer.param_groups):
+            setattr(scheduler, key, values * len(optimizer.param_groups))
     if args.amp and checkpoint.get('scaler'):
         scaler.load_state_dict(checkpoint['scaler'])
     args.start_step = checkpoint['step']
     print(f"=> resumed at step {args.start_step}, lr {optimizer.param_groups[0]['lr']:.3g}")
+
+
+def split_single_group(optimizer, saved, model):
+    """Map a one-group optimizer state (checkpoints from before setup_optimizer's weight-decay
+    split, e.g. the Nov 11 step-61000 snapshot) onto this optimizer's groups.
+
+    The old group listed the parameters in model order; each one keeps its Adam state, and every
+    group takes the old group's LR and betas but keeps its own weight decay.
+    """
+    by_id = {id(p): i for i, p in enumerate(p for g in optimizer.param_groups for p in g['params'])}
+    model_order = [id(p) for p in model.parameters() if id(p) in by_id]
+    old = saved['param_groups'][0]
+    if len(old['params']) != len(by_id):
+        raise ValueError(f"one-group optimizer state has {len(old['params'])} parameters, "
+                         f"this optimizer {len(by_id)}")
+    state = {}
+    params = {id(p): p for g in optimizer.param_groups for p in g['params']}
+    for old_index, pid in zip(old['params'], model_order):
+        if old_index in saved['state']:
+            moments = saved['state'][old_index]
+            if moments['exp_avg'].shape != params[pid].shape:
+                raise ValueError(f"one-group optimizer state {old_index} has shape "
+                                 f"{tuple(moments['exp_avg'].shape)}, parameter {tuple(params[pid].shape)}")
+            state[by_id[pid]] = moments
+    groups, start = [], 0
+    for group in optimizer.param_groups:
+        n = len(group['params'])
+        groups.append({**old, 'weight_decay': group['weight_decay'], 'params': list(range(start, start + n))})
+        start += n
+    print(f"=> split one-group optimizer state into {len(groups)} groups (weight decay "
+          + ", ".join(f"{g['weight_decay']:.3g}" for g in groups) + ")")
+    return {'state': state, 'param_groups': groups}
 
 
 def load_init(model, path):
