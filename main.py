@@ -659,7 +659,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
 
     if args.pai:
         pai_images = PAIImages(args.log_dir)
-    if args.pai and args.pai_init:
+    if args.pai and (args.pai_init or args.pai_force_switch):
         if not args.pai_control:
             # PAI records tensor shapes on the first training backward pass and cannot switch
             # without one. Run one microbatch with no optimizer step.
@@ -669,8 +669,11 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                 _, loss = model(img, lam, trt1, trt2)
             loss.backward()
             optimizer.zero_grad()
+            if args.pai_force_switch:
+                pai_setup.prepare_forced_switch(model, args.resume)
         # Score the loaded model so both arms log their starting point. The loaded model has
-        # already converged, so the perforated arm starts directly in a dendrite phase.
+        # already converged, so the perforated arm starts directly in a dendrite phase
+        # (--pai-force-switch: a further one, after the dendrite sets the checkpoint has).
         acc1 = validate(val_loader, model, start_step, device, args)
         model, restructured, _ = pai_setup.add_score(model, acc1, args, device, force_switch=not args.pai_control)
         original_model = model

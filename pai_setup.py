@@ -267,6 +267,11 @@ def add_arguments(parser):
                             'optimizer and LR scheduler from this run\'s --lr, --wd and '
                             '--pai-cosine-epochs instead of restoring the saved ones (e.g. a new '
                             'neuron phase after a dendrite-phase ablation)')
+    group.add_argument('--pai-force-switch', action='store_true',
+                       help='with --resume of a neuron-phase checkpoint: validate the loaded model and '
+                            'force PAI\'s next switch at step 0, as --pai-init does, so the run starts in '
+                            'a new dendrite phase (e.g. a second dendrite set; needs --max-dendrites above '
+                            'the sets already installed)')
     group.add_argument('--pai-warmup', default=0, type=int, metavar='STEPS',
                        help='linear LR warmup from 0 to --lr over the first STEPS optimizer steps. '
                             'PAI owns the scheduler, so --warmup does not apply to PAI runs.')
@@ -340,6 +345,8 @@ def check_args(parser, args):
         parser.error('--resume continues a PAI run; it excludes --pai-resume and --pai-init')
     if args.pai_new_schedule and not args.resume:
         parser.error('--pai-new-schedule applies only to --resume')
+    if args.pai_force_switch and (not args.resume or args.pai_control):
+        parser.error('--pai-force-switch applies only to --resume, without --pai-control')
 
 
 def plain_key(key, target):
@@ -606,6 +613,31 @@ def write_best_model(model, args):
     print(f"=> wrote pai/best_model.pt from '{resume_best_model_path(args.pai_resume)}': {copied} "
           f"weights, best epoch {tracker_value(string, 'num_epochs_run')} "
           f"(score {float(tracker_value(string, 'current_best_validation_score')):.3f})")
+
+
+def prepare_forced_switch(model, resume_path):
+    """Write pai/best_model.pt for --pai-force-switch. Call after the first training backward pass
+    (PAI creates its dendrite buffers there), with the run's log directory as cwd.
+
+    PAI reloads pai/best_model.pt, weights and tracker, at every switch, and this run's new log
+    directory has none. Write the loaded model with the tracker string exactly as the --resume
+    checkpoint saved it: restore_tracker has since advanced the tracker by one epoch
+    (start_epoch), and a best model carrying that state leaves PAI's epoch counter one ahead of
+    its history after the switch (its graphs then fail with an IndexError). This is the state PAI
+    itself would reload when the checkpoint's epoch was the source run's best; otherwise PAI
+    would have gone back to that best epoch, while this adds the next set to the loaded model.
+    """
+    checkpoint = torch.load(resume_path, map_location='cpu', weights_only=True)
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    state['tracker_string'] = checkpoint['state_dict']['tracker_string'].clone()
+    os.makedirs('pai', exist_ok=True)
+    if not GPA.pc.get_using_safe_tensors():
+        raise NotImplementedError('PAI is set to pickle whole models; prepare_forced_switch needs safetensors')
+    UPA._save_file_deduped(state, 'pai/best_model.pt')
+    string = tracker_string(checkpoint)
+    print(f"=> wrote pai/best_model.pt from the loaded model for --pai-force-switch (tracker at epoch "
+          f"{tracker_value(string, 'num_epochs_run')}, last improved epoch "
+          f"{tracker_value(string, 'epoch_last_improved')})")
 
 
 def before_first_switch():

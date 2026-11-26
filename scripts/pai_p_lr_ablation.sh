@@ -58,10 +58,20 @@
 # dataset to node-local disk once for all scales).
 # CKPT_WANDB=<run name> instead of CKPT downloads that run's W&B checkpoint artifact
 # (checkpoint-<run name>:last, from runs with --wandb-checkpoints) to $LOGS/ckpts/<run name>/.
+# SRC=<PAI run name> instead of CKPT adds a further dendrite set to a PAI run's final neuron-phase
+#   checkpoint (e.g. a scripts/pai_n_phase.sh run; downloaded like CKPT_WANDB if missing): --resume
+#   with --pai-force-switch, so the p phase starts at once with MAX_DENDRITES = the sets it has + 1.
+#   LAYER/TARGET/BATCH/ACCUM/TRAIN_FRACTION must match SRC. Needs SRC_TAG, a short label for SRC in the
+#   run name (..._d<sets+1>_..._k<K>_<STAMP>_from_<SRC_TAG>; all-12-block names become l0to11).
 # Needs PAIEMAIL/PAITOKEN (environment, the repo's .env or ~/.pai_env); W&B reads
 # WANDB_API_TOKEN from .env.
 set -euo pipefail
-[ -n "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "set CKPT to a plain main.py checkpoint, or CKPT_WANDB to its run name" >&2; exit 1; }
+if [ -n "${SRC:-}" ]; then
+    [ -z "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "SRC excludes CKPT and CKPT_WANDB" >&2; exit 1; }
+    : "${SRC_TAG:?set SRC_TAG, a short label for SRC in the run name}"
+else
+    [ -n "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "set CKPT to a plain main.py checkpoint, CKPT_WANDB to its run name, or SRC to a PAI run" >&2; exit 1; }
+fi
 : "${PEAK_LR:?set PEAK_LR to the peak LR of the neuron run}"
 : "${BATCH:?set BATCH to 1024 or 256}"
 ACCUM=${ACCUM:-1}
@@ -91,12 +101,16 @@ GD=${GD:-0}
 MAX_DENDRITES=${MAX_DENDRITES:-1}
 if [ "$GD" = 1 ]; then GD_ARGS=(--pai-gd); MODE=gd; else GD_ARGS=(); MODE=pb; fi
 if [ "$MAX_DENDRITES" -lt 1 ]; then echo "MAX_DENDRITES must be >= 1" >&2; exit 1; fi
-if [ "$MAX_DENDRITES" -gt 1 ] && [ "$GD" != 1 ]; then
+if [ "$MAX_DENDRITES" -gt 1 ] && [ "$GD" != 1 ] && [ -z "${SRC:-}" ]; then
     # PB alternates p and n phases, so its schedule for several rounds is not this one.
     echo "MAX_DENDRITES > 1 is only set up for GD=1" >&2; exit 1
 fi
 TOTAL_EPOCHS=$((P_EPOCHS * MAX_DENDRITES))
-if [ "$MAX_DENDRITES" -gt 1 ]; then
+if [ -n "${SRC:-}" ]; then
+    TOTAL_EPOCHS=$P_EPOCHS   # one p phase; MAX_DENDRITES is set from the checkpoint below
+    [ "$GD" != 1 ] || { echo "SRC is only set up for Perforated Backpropagation (GD=0)" >&2; exit 1; }
+fi
+if [ "$MAX_DENDRITES" -gt 1 ] && [ -z "${SRC:-}" ]; then
     # GD stays in neuron phases; the next round comes after P_EPOCHS validations.
     SWITCH_ARGS=(--pai-fixed-switch "$P_EPOCHS" --pai-p-epochs-to-switch "$P_EPOCHS")
 else
@@ -114,11 +128,28 @@ LOGS=${LOGS:-$HOME/runs}
 : "${PAIEMAIL:?PAIEMAIL is not set}"
 : "${PAITOKEN:?PAITOKEN is not set}"
 cd "$REPO"
-if [ -z "${CKPT:-}" ]; then
+if [ -n "${SRC:-}" ]; then
+    CKPT=$LOGS/ckpts/$SRC/checkpoint.pth.tar
+    fetch_wandb_ckpt "$SRC" "$CKPT"
+elif [ -z "${CKPT:-}" ]; then
     CKPT=$LOGS/ckpts/$CKPT_WANDB/checkpoint.pth.tar
     fetch_wandb_ckpt "$CKPT_WANDB" "$CKPT"
 fi
 test -r "$CKPT" || { echo "cannot read CKPT=$CKPT" >&2; exit 1; }
+START_STEP=0
+INIT_ARGS=(--pai-init "$CKPT")
+if [ -n "${SRC:-}" ]; then
+    read -r START_STEP SETS < <("$PYTHON" -c "
+import sys, torch
+c = torch.load(sys.argv[1], map_location='cpu', weights_only=True)
+t = ''.join(map(chr, c['state_dict']['tracker_string'].tolist())).split('\n')
+v = dict(l.split(',', 1) for l in t if l.count(',') == 1)
+assert v['mode'] == 'n', 'SRC checkpoint is not in a neuron phase'
+print(c['step'], v['num_dendrites_added'])" "$CKPT")
+    MAX_DENDRITES=$((SETS + 1))
+    INIT_ARGS=(--resume "$CKPT" --pai-new-schedule --pai-force-switch)
+    echo "=> SRC $SRC: step $START_STEP, $SETS dendrite set(s); adding set $MAX_DENDRITES"
+fi
 COMMIT=$(git log --oneline -1 2>/dev/null || echo "unknown commit (no .git)")
 REPORT=()
 if [ "${WANDB:-1}" = 1 ]; then REPORT=(--report-to wandb); fi
@@ -131,24 +162,31 @@ fi
 # stop right after the P_EPOCHS-th validation, where the fixed switch ends the p phase.
 LOG_STEPS=$((TRAIN_IMAGES / BATCH))
 MAX_STEPS=$((TOTAL_EPOCHS * LOG_STEPS))
+# --epochs counts from step 0, so a SRC run covers SRC's epochs plus this phase.
+EPOCHS=$(( (START_STEP + LOG_STEPS / 2) / LOG_STEPS + TOTAL_EPOCHS ))
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M)}
 FAILED=()
 for K in $SCALES; do
     LR=$(awk -v a="$PEAK_LR" -v k="$K" 'BEGIN { printf "%.6g", a * k }')
     RUN_NAME=vit_tiny_pai_plr_${MODE}_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_lr${PEAK_LR}_wd${WD}_d${MAX_DENDRITES}_f${TRAIN_FRACTION}${CLEAN_TAG}${LS_TAG}_k${K}_${STAMP}
+    if [ -n "${SRC:-}" ]; then
+        RUN_NAME=${RUN_NAME//l0-1-2-3-4-5-6-7-8-9-10-11_/l0to11_}_from_${SRC_TAG}
+        [ ${#RUN_NAME} -le 128 ] || { echo "run name is ${#RUN_NAME} characters, W&B allows 128: $RUN_NAME" >&2; exit 1; }
+    fi
     export WANDB_DIR=$LOGS/$RUN_NAME
     mkdir -p "$WANDB_DIR"
     echo "=== $RUN_NAME ($MODE): LR $LR ($K x $PEAK_LR, divided by ACCUM=$ACCUM in the p phase) -> 0" \
          "over $P_EPOCHS epochs per dendrite round, $MAX_DENDRITES round(s), $TOTAL_EPOCHS epochs, from $CKPT, commit $COMMIT"
-    # --pai-init perforates the loaded model and forces the switch into the p phase at step 0.
+    # --pai-init perforates the loaded model and forces the switch into the p phase at step 0
+    # (SRC: --resume reloads the PAI run, dendrites included, and --pai-force-switch does the same).
     # Dendrite (p) phases use no weight decay on the candidates, whatever --wd (pai_setup.setup_optimizer).
     if ! "$PYTHON" -u main.py "$DATA" \
         --gpu 0 --train-fraction "$TRAIN_FRACTION" --subset-seed 42 \
         --hidden-dim 192 --num-layers 12 --num-heads 3 --patch-size 16 \
         --batch-size "$BATCH" --accum-freq "$ACCUM" --tf32 --mlp-head --torchvision-inception-crop \
-        --epochs "$TOTAL_EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
+        --epochs "$EPOCHS" --max-steps "$MAX_STEPS" --log-steps "$LOG_STEPS" \
         --lr "$LR" --wd "$WD" --workers "$WORKERS" \
-        --pai-init "$CKPT" --pai-layers "${LAYERS[@]}" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
+        "${INIT_ARGS[@]}" --pai-layers "${LAYERS[@]}" --pai-target "$TARGET" --max-dendrites "$MAX_DENDRITES" "${GD_ARGS[@]}" \
         --pai-schedule cosine --pai-cosine-epochs "$P_EPOCHS" --pai-p-lr-scaling linear \
         "${SWITCH_ARGS[@]}" "${CLEAN_ARGS[@]}" "${LS_ARGS[@]}" \
         --wandb-notes "p-phase LR ablation ($MODE) from $CKPT, K=$K, peak LR $PEAK_LR, wd $WD, accum $ACCUM, train fraction $TRAIN_FRACTION, clean $CLEAN, p loss scale $P_LOSS_SCALE, dendrites $MAX_DENDRITES, target $TARGET" \
