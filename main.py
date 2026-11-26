@@ -375,6 +375,10 @@ def main_worker(gpu, args):
             pai_setup.load_init(model, args.pai_init)
         if args.pai_resume:
             pai_resume = pai_setup.load_resume(model, args.pai_resume)
+        if args.pai_control_widen:
+            # After loading the plain checkpoint, before perforate wraps fc1; a --resume then
+            # loads the widened weights into this shape.
+            pai_setup.widen_mlps(model, args.pai_layers, args.pai_control_widen)
         # PAI writes its graphs, CSVs and saves to ./pai.
         os.chdir(args.log_dir)
         original_model = model = pai_setup.perforate(model, args)

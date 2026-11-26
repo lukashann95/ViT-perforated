@@ -7,6 +7,8 @@
 # perforated, so the same neurons) with the same n phase under --pai-control, from step 0.
 # CKPT_WANDB=<run name> instead of CKPT uses $LOGS/ckpts/<run name>/checkpoint.pth.tar, downloading
 # that run's W&B artifact checkpoint-<run name>:last there if missing.
+# WIDEN=<N> (CONTROL=1 only) is the parameter-matched control: N extra MLP hidden units in every LAYER
+# block, new fc2 columns at 0 (--pai-control-widen; 388 matches one ln_fc1 dendrite set); names carry _w<N>.
 # As one task-spooler job on riddle GPU 1:
 #   forgeq-gpu 1 env GPU=1 SRC=<p-phase run name> LR=1e-4 ~/ViT-perforated/scripts/pai_n_phase.sh
 # Env: SRC (required unless CONTROL=1): the p-phase run, read from $LOGS/$SRC/checkpoints/checkpoint.pth.tar
@@ -25,6 +27,13 @@ if [ "$CONTROL" = 1 ]; then
     [ -n "${CKPT:-}${CKPT_WANDB:-}" ] || { echo "set CKPT to the plain checkpoint the p-phase run started from, or CKPT_WANDB to its run name" >&2; exit 1; }
 else
     : "${SRC:?set SRC to the p-phase run name}"
+fi
+WIDEN=${WIDEN:-0}
+if [ "$WIDEN" != 0 ]; then
+    [ "$CONTROL" = 1 ] || { echo "WIDEN applies only to CONTROL=1" >&2; exit 1; }
+    WIDEN_ARGS=(--pai-control-widen "$WIDEN"); WIDEN_TAG=_w$WIDEN
+else
+    WIDEN_ARGS=(); WIDEN_TAG=
 fi
 : "${LR:?set LR, the n-phase starting LR}"
 N_EPOCHS=${N_EPOCHS:-10}
@@ -74,8 +83,8 @@ LOG_STEPS=$((TRAIN_IMAGES / BATCH))
 if [ "$CONTROL" = 1 ]; then
     # --pai-init starts at step 0 and validates the loaded model first.
     START_STEP=0
-    INIT_ARGS=(--pai-init "$CKPT" --pai-control)
-    RUN_NAME=vit_tiny_pai_nctrl_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}${CLEAN_TAG}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)${RUN_SUFFIX:-}
+    INIT_ARGS=(--pai-init "$CKPT" --pai-control "${WIDEN_ARGS[@]}")
+    RUN_NAME=vit_tiny_pai_nctrl${WIDEN_TAG}_l${LAYER_TAG}_${TARGET}_b${BATCH}_acc${ACCUM}_f${TRAIN_FRACTION}_n${N_EPOCHS}${CLEAN_TAG}_lr${LR}_wd${WD}_$(date +%Y%m%d_%H%M)${RUN_SUFFIX:-}
     SRC="control from $CKPT"
 else
     START_STEP=$("$PYTHON" -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=True)['step'])" "$CKPT")

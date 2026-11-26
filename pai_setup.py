@@ -254,6 +254,13 @@ def add_arguments(parser):
                             "or the older CovarianceDendriteLoss")
     group.add_argument('--pai-control', action='store_true',
                        help='same wrapping, tracker and schedule, but never add dendrites')
+    group.add_argument('--pai-control-widen', type=int, default=0, metavar='N',
+                       help='with --pai-control: add N hidden units to the MLP of every --pai-layers block '
+                            '(fc1 outputs, fc2 inputs) after loading --pai-init, a parameter-matched '
+                            'control. The new fc2 columns start at 0, so the loaded model computes the '
+                            'same function, as an installed dendrite set does (its output weights start '
+                            'at 0). 388 matches one ln_fc1 dendrite set per block (385 params per unit '
+                            'vs 149,376 per set). A --resume of such a run needs the same N')
     group.add_argument('--pai-init', default='', type=str, metavar='PATH',
                        help='trained checkpoint (main.py format) to fine-tune from; '
                             'omit to train from random initialization')
@@ -347,6 +354,8 @@ def check_args(parser, args):
         parser.error('--pai-new-schedule applies only to --resume')
     if args.pai_force_switch and (not args.resume or args.pai_control):
         parser.error('--pai-force-switch applies only to --resume, without --pai-control')
+    if args.pai_control_widen < 0 or (args.pai_control_widen and not args.pai_control):
+        parser.error('--pai-control-widen takes a non-negative N and applies only to --pai-control')
 
 
 def plain_key(key, target):
@@ -683,6 +692,36 @@ def load_init(model, path):
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     model.load_state_dict(checkpoint['state_dict'])
     print(f"=> fine-tuning from '{path}' (step {checkpoint['step']}, best acc@1 {checkpoint['best_acc1']:.4f})")
+
+
+def widen_mlps(model, layers, extra):
+    """Add `extra` hidden units to the MLP of each encoder block in `layers` (--pai-control-widen).
+
+    The new fc1 rows get torchvision MLPBlock's init (Xavier-uniform weights with the original
+    fans, biases ~N(0, 1e-6)); the new fc2 columns are 0, so the output is unchanged until
+    training moves them. Call before perforate(), which wraps fc1.
+    """
+    added = 0
+    for i in layers:
+        mlp = model.encoder.layers[i].mlp
+        fc1, fc2 = mlp[0], mlp[3]
+        assert isinstance(fc1, nn.Linear) and isinstance(fc2, nn.Linear), mlp
+        width = fc1.out_features
+        new1 = nn.Linear(fc1.in_features, width + extra)
+        new2 = nn.Linear(width + extra, fc2.out_features)
+        with torch.no_grad():
+            bound = math.sqrt(6 / (fc1.in_features + width))
+            new1.weight[:width] = fc1.weight
+            new1.weight[width:].uniform_(-bound, bound)
+            new1.bias[:width] = fc1.bias
+            new1.bias[width:].normal_(std=1e-6)
+            new2.weight[:, :width] = fc2.weight
+            new2.weight[:, width:] = 0
+            new2.bias.copy_(fc2.bias)
+        mlp[0], mlp[3] = new1, new2
+        added += extra * (fc1.in_features + 1 + fc2.out_features)
+    print(f"=> widened the MLPs of blocks {list(layers)} by {extra} hidden units each "
+          f"(+{added} params, new fc2 columns 0)")
 
 
 def perforate(model, args):
