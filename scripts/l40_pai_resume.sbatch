@@ -54,13 +54,6 @@
 # safety cap: PAI ends the run when it stops improving.
 # Paths, if setup_machine.sh ran with non-default ones: REPO, VENV, DATA_VENV, DATA_DIR,
 # PARQUET_DIR, LOG_ROOT (default <repo parent>/runs), LOCAL (the unpack directory).
-# HISTORY_FROM=<project>/<run>: the W&B run whose history is copied in (default: RESUME's run in
-# this project); the step-61000 source run is in ViT-perforated-amp.
-# DATA=<ImageFolder with train/ and val/>: use it as is instead of unpacking the parquet shards.
-# Training overrides (defaults as above): BATCH (1024), LR (1e-3), LOG_STEPS (250),
-# TRAIN_FRACTION (0.2), WORKERS (CPUs - 2). BATCH/LR other than the defaults add _b<batch>_lr<lr>
-# to the run name. SEED=<n> passes --seed n (deterministic cuDNN) and adds _s<n>, for repeats of
-# the same arm. Arguments after the script name go to main.py unchanged (e.g. --max-steps 200).
 
 set -euo pipefail
 umask 002
@@ -133,18 +126,10 @@ esac
 PRECISION=(--tf32)
 PREC_TAG=fp32
 if [ "${AMP:-0}" = 1 ]; then PRECISION=(--amp); PREC_TAG=amp; fi
-BATCH=${BATCH:-1024}
-LR=${LR:-1e-3}
-LOG_STEPS=${LOG_STEPS:-250}
-TRAIN_FRACTION=${TRAIN_FRACTION:-0.2}
-HP_TAG=
-if [ "$BATCH" != 1024 ] || [ "$LR" != 1e-3 ]; then HP_TAG=_b${BATCH}_lr${LR}; fi
-SEED_ARGS=()
-if [ -n "${SEED:-}" ]; then SEED_ARGS=(--seed "$SEED"); HP_TAG=${HP_TAG}_s${SEED}; fi
 SCRATCH=${SCRATCH:-0}
 KIND=resume
 [ "$SCRATCH" = 1 ] && KIND=scratch
-RUN_PREFIX="vit_tiny_pai_${KIND}_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}${HP_TAG}_20pct_"
+RUN_PREFIX="vit_tiny_pai_${KIND}_${ARM_TAG}_${PAI_TARGET}_${PAI_MODE}${LOSS_TAG}_${PREC_TAG}_20pct_"
 if [ -n "${CONTINUE_RUN:-}" ]; then
     case "$CONTINUE_RUN" in
         "$RUN_PREFIX"*) ;;
@@ -167,29 +152,20 @@ else
     if [ "$SCRATCH" = 1 ]; then
         START_ARGS=(--pai-warmup "${PAI_WARMUP:-2000}")
     else
-        START_ARGS=(--pai-resume "$RESUME" --wandb-history-from "${HISTORY_FROM:-$SRC_RUN}")
+        START_ARGS=(--pai-resume "$RESUME" --wandb-history-from "$SRC_RUN")
     fi
     WANDB_DIR=$LOG_ROOT/$RUN_NAME
 fi
 
 # Keys from the .env that setup_machine.sh checked (W&B token, PAI license, W&B entity/project).
-# W&B entity/project set on the command line win over the .env.
-CLI_WANDB_ENTITY=${WANDB_ENTITY:-}
-CLI_WANDB_PROJECT=${WANDB_PROJECT:-}
 set -a; source "$REPO/.env"; set +a
-WANDB_ENTITY=${CLI_WANDB_ENTITY:-${WANDB_ENTITY:-}}
-WANDB_PROJECT=${CLI_WANDB_PROJECT:-${WANDB_PROJECT:-}}
 : "${PAIEMAIL:?PAIEMAIL is not set in $REPO/.env}"
 : "${PAITOKEN:?PAITOKEN is not set in $REPO/.env}"
 : "${WANDB_API_TOKEN:?WANDB_API_TOKEN is not set in $REPO/.env}"
 test -x "$PYTHON" || { echo "no training venv at $VENV: run scripts/setup_machine.sh" >&2; exit 1; }
-if [ -n "${DATA:-}" ]; then
-    [ -d "$DATA/train" ] && [ -d "$DATA/val" ] || { echo "DATA=$DATA has no train/ and val/" >&2; exit 1; }
-else
 test -x "$DATA_VENV/bin/python" || { echo "no pyarrow venv at $DATA_VENV: run scripts/setup_machine.sh" >&2; exit 1; }
 if ! compgen -G "$PARQUET/train-*.parquet" >/dev/null || ! compgen -G "$PARQUET/val-*.parquet" >/dev/null; then
     echo "no train-*/val-*.parquet shards in $PARQUET (set PARQUET_DIR)" >&2; exit 1
-fi
 fi
 if [ -n "${RESUME_WANDB:-}" ] && [ -z "${CONTINUE_RUN:-}" ] && [ "$SCRATCH" != 1 ]; then
     # Same layout as the run's archive/pre_switch/: checkpoint.pth.tar and pai/best_model.pt.
@@ -212,9 +188,6 @@ if [ -z "${CONTINUE_RUN:-}" ] && [ "$SCRATCH" != 1 ]; then
 fi
 mkdir -p "$LOG_ROOT"
 
-if [ -n "${DATA:-}" ]; then
-    LOCAL=$DATA
-else
 # Unpack the parquet shards to node-local disk (faster than unpacking once on shared storage).
 mkdir -p "$LOCAL"
 avail_gb=$(df -BG --output=avail "$LOCAL" | tail -1 | tr -dc 0-9)
@@ -227,7 +200,6 @@ echo "Unpacking ImageNet from $PARQUET to $LOCAL ($avail_gb GB free)..."
 start=$SECONDS
 "$DATA_VENV/bin/python" "$REPO/scripts/parquet_to_imagefolder.py" "$PARQUET" "$LOCAL" --workers "$CPUS"
 echo "Unpacked in $((SECONDS - start)) s"
-fi
 
 export WANDB_DIR
 export WANDB_ENTITY=${WANDB_ENTITY:-IdlF26Group40}
@@ -240,22 +212,21 @@ echo "Run $RUN_NAME: layer(s) ${LAYERS[*]}, CONTROL=$CONTROL, patience $PAI_PATI
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 "$PYTHON" -u main.py "$LOCAL" \
     --gpu 0 \
-    --train-fraction "$TRAIN_FRACTION" \
+    --train-fraction 0.2 \
     --subset-seed 42 \
     --hidden-dim 192 \
     --num-layers 12 \
     --num-heads 3 \
     --patch-size 16 \
-    --batch-size "$BATCH" \
+    --batch-size 1024 \
     --accum-freq 1 \
     "${PRECISION[@]}" \
     --mlp-head \
     --torchvision-inception-crop \
     --epochs "$EPOCHS" \
-    --lr "$LR" \
-    --log-steps "$LOG_STEPS" \
-    --workers "${WORKERS:-$((CPUS > 4 ? CPUS - 2 : 2))}" \
-    ${SEED_ARGS[@]+"${SEED_ARGS[@]}"} \
+    --lr 1e-3 \
+    --log-steps 250 \
+    --workers $((CPUS > 4 ? CPUS - 2 : 2)) \
     "${START_ARGS[@]}" \
     "${PAI_ARGS[@]}" \
     ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} \
@@ -266,5 +237,4 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --logs "$LOG_ROOT" \
     --name "$RUN_NAME" \
     --report-to wandb \
-    ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"} \
-    "$@"
+    ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"}
