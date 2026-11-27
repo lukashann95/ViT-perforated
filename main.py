@@ -29,6 +29,7 @@ from torch.utils.data import Subset
 
 import wandb
 
+import lr_replay
 import pai_setup
 from pai_images import PAIImages
 from simple_vit import SimpleVisionTransformer
@@ -170,6 +171,16 @@ parser.add_argument("--wandb-checkpoints", action='store_true',
                          "kept: 'last' (every validation), 'best' (best acc@1) and, for PAI runs, "
                          "'pre_switch' (the last state before the first switch to dendrites, "
                          "for --pai-resume); versions left without an alias are deleted")
+parser.add_argument('--init', default='', type=str, metavar='PATH',
+                    help='start from the weights of this checkpoint only (no optimizer, step or LR '
+                         'schedule): a main.py checkpoint, plain or from a PAI run before its first '
+                         "switch, or PAI's pai/best_model.pt. Not for PAI runs (see --pai-init).")
+parser.add_argument('--replay-lr', default='', type=str, metavar='JSON',
+                    help='train without PAI on the LR schedule of a PAI run, with its optimizer '
+                         'resets and best-model reloads (see lr_replay.py; built by '
+                         'scripts/build_replay_lr.py). Sets the start step and the number of steps; '
+                         '--epochs and --warmup do not apply. Validate every --log-steps of the '
+                         'schedule.')
 pai_setup.add_arguments(parser)
 best_acc1 = 0
 
@@ -286,6 +297,10 @@ def main():
     else:
         args.ngpus_per_node = 1
     pai_setup.check_args(parser, args)
+    if args.pai and (args.init or args.replay_lr):
+        parser.error('--init and --replay-lr are for runs without PAI')
+    if args.init and args.resume:
+        parser.error('--init starts a new run; --resume continues one')
     args.repo_dir = os.path.dirname(os.path.abspath(__file__))
     if args.pai:
         # PAI runs change into the log directory, so later paths must not depend on the cwd.
@@ -372,6 +387,8 @@ def main_worker(gpu, args):
         register=args.register,
     )
     pai_resume = None
+    if args.init:
+        lr_replay.load_weights(model, args.init)
     if args.pai:
         if args.pai_init:
             pai_setup.load_init(model, args.pai_init)
@@ -524,6 +541,17 @@ def main_worker(gpu, args):
 
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.total_batch_size)
+    replay = None
+    if args.replay_lr:
+        replay = lr_replay.LRReplay(args.replay_lr)
+        if args.log_steps != replay.log_steps:
+            raise ValueError(f'--log-steps {args.log_steps}: the schedule switches phases after '
+                             f'validations every {replay.log_steps} steps')
+        total_steps = replay.total_steps
+        if not args.resume:
+            args.start_step = replay.start_step
+        print(f"=> replaying the LR schedule of {replay.source_run}: steps {replay.start_step + 1}"
+              f"-{total_steps}, {len(replay.load_best)} phases")
     # Logged as 'epoch' with every W&B entry, so runs with different batch sizes line up.
     args.steps_per_epoch = n / args.total_batch_size
     args.specified_steps = {round(n * epoch / args.total_batch_size) for epoch in args.log_epoch}
@@ -549,7 +577,10 @@ def main_worker(gpu, args):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler,
         multiprocessing_context='spawn', prefetch_factor=1, persistent_workers=True)
 
-    if not args.pai:
+    if replay is not None:
+        # The replay sets the LR at every step; this scheduler only keeps checkpoints uniform.
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+    elif not args.pai:
         scheduler = cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
         if args.warmup:
             warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / args.warmup)
@@ -571,6 +602,8 @@ def main_worker(gpu, args):
             scheduler.load_state_dict(checkpoint['scheduler'])
             if args.amp and checkpoint.get('scaler'):
                 scaler.load_state_dict(checkpoint['scaler'])
+            if replay is not None:
+                replay.load_state_dict(checkpoint['replay'])
             print("=> loaded checkpoint '{}' (step {})"
                   .format(args.resume, checkpoint['step']))
         else:
@@ -612,7 +645,7 @@ def main_worker(gpu, args):
         # evaluate on validation set.
         validate(val_loader, model, args.start_step, device, args)
     else:
-        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args)
+        train(train_loader, train_sampler, val_loader, args.start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args, replay)
         if args.wandb and args.wandb_checkpoints and is_primary(args):
             finish_checkpoint_uploads(args)
 
@@ -629,7 +662,7 @@ def infinite_loader(loader, sampler):
         epoch += 1
 
 
-def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args):
+def train(train_loader, train_sampler, val_loader, start_step, total_steps, original_model, model, optimizer, scheduler, scaler, device, args, replay=None):
     if args.max_steps is not None:
         total_steps = min(total_steps, start_step + args.max_steps)
         args.specified_steps.add(total_steps)
@@ -684,6 +717,13 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             wandb.log({**pai_setup.stats(), **image_data, 'epoch': start_step / args.steps_per_epoch},
                       step=start_step)
 
+    if replay is not None and start_step == replay.start_step:
+        # Score the starting point, which also counts as the first cycle's best model so far.
+        acc1 = validate(val_loader, model, start_step, device, args)
+        model.train()
+        replay.record(acc1, original_model)
+        best_acc1 = max(best_acc1, acc1)
+
     # PAI sizes its dendrite buffers on the first training backward pass, so a resumed run writes
     # the source run's best model (which PAI reloads at a switch) after its first step.
     best_model_pending = args.pai and bool(args.pai_resume)
@@ -694,6 +734,9 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             pai_setup.DIAG['step'] = step
         if args.pai and step <= args.pai_warmup:
             pai_setup.warmup_lr(optimizer, args, step)
+        if replay is not None:
+            replay.start_phase(step, original_model, optimizer)
+            replay.set_lr(step, optimizer)
         step_loss = 0.0
         step_correct = 0.0
         # The phase only changes at validations, so it is fixed for the whole step.
@@ -802,6 +845,10 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     "l2_params": math.sqrt(l2_params),
                     "epoch": step / args.steps_per_epoch,
                 }
+                if replay is not None:
+                    # The PAI run's step at this point of its schedule, to line the two runs up.
+                    log_data["replay/source_step"] = replay.source_step(step)
+                    log_data["replay/source_epoch"] = replay.source_step(step) / args.steps_per_epoch
                 # Keep this step open so validation (and PAI stats/plots) land on the same W&B step;
                 # committing here would make W&B drop the later val/* log for this step.
                 pai_validation = (step % args.log_steps == 0 or step in args.specified_steps)
@@ -813,7 +860,7 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
         # Overflow skips the optimizer update, so also skip the LR update.
         # Advance before checkpointing so resume restores the next step's LR.
         # PAI steps its own scheduler at validations instead.
-        if optimizer_updated and not args.pai:
+        if optimizer_updated and not args.pai and replay is None:
             scheduler.step()
 
         if step % args.log_steps == 0 or step in args.specified_steps:
@@ -824,6 +871,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
             # remember best acc@1 and save checkpoint
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
+            if replay is not None:
+                replay.record(acc1, original_model)
 
             training_complete = False
             if args.pai:
@@ -852,6 +901,8 @@ def train(train_loader, train_sampler, val_loader, start_step, total_steps, orig
                     'scheduler' : scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
                 }
+                if replay is not None:
+                    ckpt['replay'] = replay.state_dict()
                 save_checkpoint(ckpt, is_best, args.checkpoint_path, step=step if step in args.specified_steps else None)
                 if args.pai:
                     pai_setup.archive_pre_switch(args)
